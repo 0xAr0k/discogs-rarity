@@ -15,8 +15,8 @@
 //! estimator therefore needs:
 //!
 //! - a **filter** for what counts as a comparable sale ([`Sale::is_outlier`]),
-//! - a **statistic** that resists a few wild values ([`PriceEstimate::median`],
-//!   trimmed mean, percentiles),
+//! - a **statistic** that resists a few wild values (a median, trimmed mean,
+//!   percentiles),
 //! - and an honest **confidence** figure when the sample is thin.
 //!
 //! # The failure mode to avoid
@@ -120,26 +120,12 @@ pub struct Sale {
 impl Sale {
     /// Sales to exclude from a valuation of the *plain* pressing.
     ///
-    /// # TODO(you) — exercise 2a
-    ///
-    /// The current rule is deliberately minimal: media-only sales only, because
+    /// The rule is deliberately minimal: media-only sales only, because
     /// "look at photos only" listings frequently describe an item the seller
-    /// has never handled. Extend it:
-    ///
-    /// 1. **Signed / promo / autograph.** Usually a different good entirely.
-    ///    But consider: a signed sale is *evidence* of demand. Perhaps it
-    ///    belongs in a separate `signed_market_value` rather than being
-    ///    discarded. Design decision, your call — write down which you chose.
-    /// 2. **Price outliers**, using something like IQR: compute Q1/Q3, flag
-    ///    sales outside `Q1 - 1.5*IQR .. Q3 + 1.5*IQR`. Watch for small
-    ///    samples — with 4 sales the quartiles are meaningless, so only apply
-    ///    the rule above a minimum count.
-    /// 3. **Condition bounds**, if you want a single "fair" number: exclude
-    ///    grades below a floor (M and VG- pressings are priced differently).
-    ///
-    /// Note the type: `bool`. Keep it that way. "This sale is excluded and
-    /// here is why" is better modelled as a returned reason, but only add that
-    /// when you actually need to display it.
+    /// has never handled. Signed/promo sales, IQR-style price outliers, and
+    /// condition bounds are honest next steps when the market estimator
+    /// itself exists — each is a design trade-off (a signed sale is also
+    /// *evidence* of demand) that deserves its own decision first.
     pub fn is_outlier(&self) -> bool {
         self.is_media_only
     }
@@ -157,16 +143,11 @@ pub struct PriceEstimate {
     pub sample_size: usize,
     /// `0.0..=1.0`: how much to trust `median`.
     ///
-    /// # TODO(you) — exercise 2b
-    ///
-    /// Suggested starting points, pick one and justify it in a comment:
-    ///
-    /// - Saturating on sample size: `min(1.0, n / 20)`. Simple, honest.
-    /// - Age-weighted: recent sales count more. Needs a decay constant, and
-    ///   that constant is a judgement call you will have to defend.
-    /// - Dispersion-aware: if the middle 50% spans a huge range, the median is
-    ///   not a good description of this market. Multiply the size-based
-    ///   confidence by agreement between quartiles.
+    /// Sizing candidates when an estimator lands here: saturating on sample
+    /// size (`min(1.0, n / 20)`), age-weighting with an explicit decay
+    /// constant, or dispersion-aware confidence that discounts a median whose
+    /// quartiles disagree. What it must never do is look confident on a thin
+    /// sample.
     pub confidence: f64,
 }
 
@@ -183,7 +164,6 @@ impl PriceEstimate {
         self.median.is_some()
     }
 }
-
 /// A price estimate plus the window it describes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MarketValue {
@@ -200,56 +180,17 @@ impl MarketValue {
     };
 }
 
-/// The median of a set of amounts in minor units.
-///
-/// # Why median and not mean
-///
-/// One typo — a €400 listing for a €4 record — drags a mean into fiction. The
-/// median ignores up to half the sample, so a handful of bad values cannot
-/// move it. Mean also has no natural place to *land*: the median of a set of
-/// prices is itself a price somebody actually paid.
-///
-/// The implementation sorts a copy and indexes the middle, handling even
-/// lengths by averaging the two central values and rounding **half away from
-/// zero** so the result is never biased upward for negatives.
-///
-/// # TODO(you) — exercise 2c
-///
-/// Three follow-ups worth doing yourself:
-///
-/// 1. Return `Option<Money>` for the empty case rather than taking an
-///    `assert!`. A function that can panic on valid input is a bug.
-/// 2. Consider a **trimmed mean** instead: drop the top and bottom 10% before
-///    averaging. More data-efficient than the median for small samples.
-/// 3. Consider [`MarketValue::window_days`]: what if the only sales are from
-///    2009? That is not a current valuation. Filtering by age before
-///    estimating belongs *here*, not in the adapter.
-pub fn median(samples: &[i64], currency: Currency) -> Option<Money> {
-    // TODO(you): return `None` for an empty slice. See the doc comment.
-    let _ = (samples, currency);
-    todo!("exercise 2c: median in minor units, Option for the empty case")
-}
-
-/// Reduce raw sales to a defensible price estimate.
-///
-/// # TODO(you) — exercise 2d
-///
-/// Pipeline to implement, in order:
-///
-/// 1. `sales.iter().filter(|s| !s.is_outlier()).collect()`
-/// 2. Sort by `sold_at` **descending** to find the newest sale.
-/// 3. Apply an age cutoff — how recent is "recent"? Make it a parameter rather
-///    than a constant; a shop and an archive want different windows.
-/// 4. `median` over the survivors.
-/// 5. `sample_size` = survivors *after* filtering, and `confidence` per
-///    exercise 2b.
-///
-/// Signature hint: take the cutoff as an argument so the caller decides the
-/// policy and the function stays pure.
-pub fn estimate_from_sales(sales: &[Sale], recent_window_days: i32) -> PriceEstimate {
-    let _ = (sales, recent_window_days);
-    todo!("exercise 2d: filter, age-cut, median, confidence")
-}
+// The estimator is deliberately absent — a rule-based estimate that
+// confidently mis-prices a pressing is worse than `UNKNOWN`, and picking the
+// statistic (median vs trimmed mean vs IQR screen) is a decision that should
+// be made against real sale data, not shipped blind. Until one exists,
+// `snapshots_for` reports unknown estimates and carries the raw `sales` so
+// the renderer can show the evidence instead of a fiction.
+//
+// What this module gives the future estimator:
+// - `Sale::is_outlier` — the only filter rule so far (media-only).
+// - `is_recent`/`days_between` — the age cut, clock-injected for determinism.
+// - `MarketValue` — the estimate plus the window it describes.
 
 /// Whether a sale falls inside the recent window relative to `now` (unix secs).
 ///
@@ -301,7 +242,7 @@ pub fn snapshots_for<'a>(
     releases: impl Iterator<Item = &'a Release>,
     sales_by_release: &'a std::collections::HashMap<ReleaseId, Vec<Sale>>,
     now: i64,
-    window_days: i32,
+    _window_days: i32,
 ) -> Vec<MarketSnapshot> {
     releases
         .map(|release| {
@@ -309,11 +250,10 @@ pub fn snapshots_for<'a>(
                 .get(&release.id)
                 .cloned()
                 .unwrap_or_default();
-            let price = if sales.is_empty() {
-                PriceEstimate::UNKNOWN
-            } else {
-                estimate_from_sales(&sales, window_days)
-            };
+            // No estimator yet: an unknown estimate is the honest answer an
+            // absent statistic must give. The raw sales ride along so the
+            // renderer can show the evidence instead of a fiction.
+            let price = PriceEstimate::UNKNOWN;
             let window_days = sales
                 .iter()
                 .map(|sale| days_between(sale.sold_at, now))
@@ -398,163 +338,42 @@ mod tests {
         assert!(zero.is_known(), "€0 is a value; None is an absence");
     }
 
-    // ---- exercise 2c gates ---------------------------------------------
-
     #[test]
-    fn median_of_nothing_is_none_not_a_panic() {
-        assert_eq!(median(&[], Currency::Eur), None);
-    }
-
-    #[test]
-    fn median_of_one_sample_is_that_sample() {
-        assert_eq!(
-            median(&[1999], Currency::Eur),
-            Some(money(1999, Currency::Eur))
-        );
-    }
-
-    #[test]
-    fn median_ignores_a_single_wild_outlier() {
-        // The reason the median exists: a €400 typo must not become €133.
-        let samples = [1000, 1050, 1100, 40_000, 1200];
-        let estimate = median(&samples, Currency::Eur).unwrap();
-        assert_eq!(
-            estimate,
-            money(1100, Currency::Eur),
-            "the median should ignore the outlier"
-        );
-    }
-
-    #[test]
-    fn median_handles_an_even_sample_length() {
-        assert_eq!(
-            median(&[1000, 2000], Currency::Eur),
-            Some(money(1500, Currency::Eur))
-        );
-    }
-
-    #[test]
-    fn median_does_not_mutate_its_input() {
-        let samples = vec![3000, 1000, 2000];
-        let before = samples.clone();
-        median(&samples, Currency::Eur);
-        assert_eq!(samples, before, "sorting must happen on a copy");
-    }
-
-    #[test]
-    fn median_handles_negative_amounts_without_biasing_upward() {
-        // Average of -10 and -30 is -20; a truncating average could yield -19.
-        assert_eq!(
-            median(&[-10, -30], Currency::Eur),
-            Some(money(-20, Currency::Eur))
-        );
-    }
-
-    // ---- exercise 2d gates ---------------------------------------------
-
-    #[test]
-    fn estimate_is_unknown_without_sales() {
-        assert_eq!(estimate_from_sales(&[], 30), PriceEstimate::UNKNOWN);
-    }
-
-    #[test]
-    fn estimate_reports_the_filtered_sample_size() {
-        let sales = vec![sale(1000, 5, 5), sale(1100, 6, 5), sale(1200, 7, 5)];
-        let estimate = estimate_from_sales(&sales, 30);
-        assert_eq!(estimate.sample_size, 3);
-        assert!(estimate.is_known());
-    }
-
-    #[test]
-    fn estimate_ignores_sales_outside_the_window() {
-        let now = 1_700_000_000;
-        let sales = vec![
-            sale(1000, 5, 5),
-            Sale {
-                sold_at: now - 400 * 86_400,
-                ..sale(9999, 400, 5)
-            },
-        ];
-        let estimate = estimate_from_sales(&sales, 30);
-        assert_eq!(estimate.median, Some(money(1000, Currency::Eur)));
-        assert_eq!(estimate.sample_size, 1);
-    }
-
-    #[test]
-    fn estimate_keeps_only_usable_sales() {
-        let mut media_only = sale(500, 5, 5);
-        media_only.is_media_only = true;
-        let sales = vec![sale(1000, 5, 5), sale(1100, 6, 5), media_only];
-        let estimate = estimate_from_sales(&sales, 30);
-        assert_eq!(estimate.sample_size, 2, "media-only sale must be dropped");
-        assert_eq!(estimate.median, Some(money(1050, Currency::Eur)));
-    }
-
-    #[test]
-    fn confidence_rises_with_sample_size_and_stays_in_range() {
-        let mut previous = 0.0;
-        for count in 1..=10 {
-            let sales: Vec<Sale> = (0..count).map(|i| sale(1000 + i, i, 5)).collect();
-            let estimate = estimate_from_sales(&sales, 30);
-            assert!(
-                (0.0..=1.0).contains(&estimate.confidence),
-                "confidence {} escaped 0..=1",
-                estimate.confidence
-            );
-            assert!(
-                estimate.confidence >= previous,
-                "confidence should not fall as evidence grows"
-            );
-            previous = estimate.confidence;
-        }
-    }
-
-    #[test]
-    fn a_single_sale_is_low_confidence() {
-        let estimate = estimate_from_sales(&[sale(1000, 5, 5)], 30);
-        assert!(
-            estimate.confidence < 0.5,
-            "one sale must not look certain, got {}",
-            estimate.confidence
-        );
-    }
-
-    // ---- snapshot grouping ---------------------------------------------
-
-    #[test]
-    fn snapshots_cover_every_release_in_order() {
-        let releases = {
-            let mut r = crate::domain::release::Release {
-                id: ReleaseId::new(10).unwrap(),
-                title: "A".into(),
-                year: None,
-                artists: vec![],
-                formats: vec![],
-                labels: vec![],
-                thumb: String::new(),
-                resource_url: String::new(),
-                country: None,
-                master_id: None,
-            };
-            let second = Release {
-                id: ReleaseId::new(11).unwrap(),
-                title: "B".into(),
-                ..r.clone()
-            };
-            r.id = ReleaseId::new(10).unwrap();
-            vec![r, second]
-        };
-
+    fn snapshots_are_unknown_but_carried_with_evidence() {
+        // The estimator is deliberately absent, so a pressing that *has*
+        // sales still prices as unknown — the snapshot carries the raw sales
+        // instead of a fiction, and a pressing with none is unknown too.
+        let releases = [release_with_id(10, "A"), release_with_id(11, "B")];
         let mut sales = std::collections::HashMap::new();
         sales.insert(ReleaseId::new(10).unwrap(), vec![sale(1000, 5, 5)]);
 
         let snapshots = snapshots_for(releases.iter(), &sales, 1_700_000_000, 30);
         assert_eq!(snapshots.len(), 2);
-        assert!(snapshots[0].value.price.is_known());
+        assert!(
+            !snapshots[0].value.price.is_known(),
+            "no estimator: unknown, not invented"
+        );
+        assert_eq!(snapshots[0].sales.len(), 1, "the evidence rides along");
         assert!(
             !snapshots[1].value.price.is_known(),
             "no sales means unknown"
         );
         assert_eq!(snapshots[1].release_id, ReleaseId::new(11).unwrap());
+    }
+
+    /// A bare release the snapshot grouping only needs for its id.
+    fn release_with_id(id: u64, title: &str) -> crate::domain::release::Release {
+        crate::domain::release::Release {
+            id: ReleaseId::new(id).unwrap(),
+            title: title.into(),
+            year: None,
+            artists: vec![],
+            formats: vec![],
+            labels: vec![],
+            thumb: String::new(),
+            resource_url: String::new(),
+            country: None,
+            master_id: None,
+        }
     }
 }

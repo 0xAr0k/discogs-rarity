@@ -19,6 +19,7 @@
 //! If a change to this module makes you want to `use crate::adapters::…`, the
 //! rule belongs somewhere else.
 
+pub mod browse;
 pub mod collection;
 pub mod identity;
 pub mod market;

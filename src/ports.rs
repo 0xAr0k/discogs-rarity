@@ -42,6 +42,9 @@
 
 use std::time::Duration;
 
+use crate::domain::browse::{
+    ArtistProfile, CatalogPage, EntityKind, LabelProfile, ReleaseDetail, SearchPage, WantEntry,
+};
 use crate::domain::collection::Page;
 use crate::domain::identity::{FolderId, PageSize, ReleaseId, Username};
 use crate::domain::market::Sale;
@@ -102,13 +105,68 @@ pub trait Clock {
     fn now_unix(&self) -> i64;
 }
 
+/// A source of Discogs database lookups for the digger: artists, labels,
+/// release details, search.
+///
+/// # Contract
+///
+/// Each method maps one Discogs endpoint, one page at a time; the adapter
+/// translates and paces but does not filter or interpret. Vinyl filtering
+/// ([`crate::domain::browse::is_vinyl_format`]) happens in the adapter's row
+/// mapping, since it is a *display* decision about the table the digger
+/// asked for — see `docs/DISCOGS.md` § endpoints for the full list and the
+/// quirks en route.
+///
+/// Separate from [`CollectionSource`] on purpose: different endpoints, and a
+/// different app surface. The collection flow stays untouched.
+pub trait CatalogSource {
+    /// Who recorded this music.
+    fn artist(&self, id: u64) -> Result<ArtistProfile>;
+    /// The label, and who runs it.
+    fn label(&self, id: u64) -> Result<LabelProfile>;
+    /// Everything the release endpoint says, in USD where money appears.
+    fn release_detail(&self, id: ReleaseId) -> Result<ReleaseDetail>;
+    /// One page of the artist's releases, vinyl only, newest year first.
+    fn artist_releases(&self, id: u64, page: u32) -> Result<CatalogPage>;
+    /// One page of the label's releases, vinyl only.
+    fn label_releases(&self, id: u64, page: u32) -> Result<CatalogPage>;
+    /// Name search. Requires a token upstream; without one the adapter
+    /// returns an error the UI can name.
+    fn search(&self, query: &str, kind: Option<EntityKind>, page: u32) -> Result<SearchPage>;
+}
+
+/// The digger's local wantlist: the only truth about what to look for.
+///
+/// # Why this is a *file-backed* port and not memory-only
+///
+/// Entries survive restarts by definition — a wantlist that vanishes when the
+/// terminal closes is a note that was never written. `&self` throughout:
+/// the store mutates only its own file, never anything the caller sees.
+pub trait WantlistStore {
+    /// Adds an entry. `Ok(true)` when it was new; `Ok(false)` when it already
+    /// existed (the stored name is kept — first answer wins).
+    fn add(&self, entry: &WantEntry) -> Result<bool>;
+    /// Removes an entry, `Ok(true)` when something was removed.
+    fn remove(&self, kind: EntityKind, id: u64) -> Result<bool>;
+    /// Every entry, newest first.
+    fn list(&self) -> Result<Vec<WantEntry>>;
+    /// Whether `(kind, id)` is already wanted.
+    fn contains(&self, kind: EntityKind, id: u64) -> Result<bool>;
+}
+
 /// Convenience: rate-limit pacing policy, stated in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pacing {
-    /// Minimum gap between requests.
+    /// Floor applied to a server-provided `Retry-After`: never wait less
+    /// than this, so a one-second header cannot cause a hot loop. (The
+    /// request budget itself is a token bucket — see `cap` — not a gap.)
     pub interval: Duration,
     /// Longest we are willing to wait on a rate-limit response.
     pub max_backoff: Duration,
+    /// The wire's documented request budget per minute: 60 with a token,
+    /// 25 without. The adapter's pacing gate spends this as tokens —
+    /// bursts up to its capacity, then refills at cap/minute.
+    pub cap: u32,
 }
 
 impl Pacing {
@@ -117,12 +175,14 @@ impl Pacing {
     pub const AUTHENTICATED: Self = Self {
         interval: Duration::from_millis(1100),
         max_backoff: Duration::from_secs(300),
+        cap: 60,
     };
 
     /// Pacing for an anonymous client: 25 requests/min.
     pub const ANONYMOUS: Self = Self {
         interval: Duration::from_millis(2500),
         max_backoff: Duration::from_secs(300),
+        cap: 25,
     };
 
     /// Pick pacing based on whether a token is present.

@@ -79,6 +79,89 @@ impl fmt::Display for ReleaseId {
     }
 }
 
+/// A Discogs artist ID. Same rules as [`ReleaseId`]: never zero, Discogs
+/// starts at 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtistId(u64);
+
+impl ArtistId {
+    pub const FIRST: Self = Self(1);
+    pub const MAX: u64 = ReleaseId::MAX;
+
+    pub const fn new(id: u64) -> Option<Self> {
+        if id == 0 || id > Self::MAX {
+            None
+        } else {
+            Some(Self(id))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ArtistId {
+    type Error = DomainError;
+
+    fn try_from(id: u64) -> Result<Self, Self::Error> {
+        Self::new(id).ok_or(DomainError::ZeroReleaseId)
+    }
+}
+
+impl From<ArtistId> for u64 {
+    fn from(id: ArtistId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for ArtistId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A Discogs label ID. Same rules as [`ReleaseId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LabelId(u64);
+
+impl LabelId {
+    pub const FIRST: Self = Self(1);
+    pub const MAX: u64 = ReleaseId::MAX;
+
+    pub const fn new(id: u64) -> Option<Self> {
+        if id == 0 || id > Self::MAX {
+            None
+        } else {
+            Some(Self(id))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for LabelId {
+    type Error = DomainError;
+
+    fn try_from(id: u64) -> Result<Self, Self::Error> {
+        Self::new(id).ok_or(DomainError::ZeroReleaseId)
+    }
+}
+
+impl From<LabelId> for u64 {
+    fn from(id: LabelId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for LabelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A collection folder ID. Zero is meaningful here — it means *all folders* —
 /// so unlike [`ReleaseId`] it is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

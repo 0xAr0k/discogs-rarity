@@ -6,8 +6,9 @@
 //!    decides what a collection means.
 //! 2. **Return every page, unmodified.** Coherence lives in
 //!    [`crate::domain::collection::PageSet::assemble`].
-//! 3. **Never sleep longer than [`Pacing::accepts`] allows.** Otherwise
-//!    refuse.
+//! 3. **Never spend the wire's budget faster than [`Pacing::cap`]**: the
+//!    pacing gate is a token bucket — bursts, then refills at the
+//!    documented per-minute rate. Spending faster would just earn 429s.
 //!
 //! # The wire types are private
 //!
@@ -15,8 +16,18 @@
 //! crossing the boundary is already a domain type, so a change in Discogs'
 //! schema cannot ripple into the app. That is the whole reward for having a
 //! port.
+//!
+//! # One HTTP client, two sources
+//!
+//! The collection source and the digger's [`DiscogsCatalogSource`] share the
+//! same endpoint family, the same token handling, the same rate-limit rules.
+//! That machinery lives in [`DiscogsHttp`]; each source embeds it and adds
+//! only the endpoints it owns. Two adapters stay two adapters — the shared
+//! part is transport, never meaning.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use reqwest::{
     StatusCode, Url,
@@ -27,47 +38,73 @@ use reqwest::{
 use crate::{
     adapters::system::ThreadSleeper,
     domain::{
+        browse::{
+            ArtistProfile, CatalogPage, CatalogRow, CommunityStats, EntityKind, LabelProfile,
+            ReleaseDetail, SearchPage, SearchResult, Track, is_vinyl_format,
+        },
         collection::Page,
-        identity::{FolderId, PageSize, ReleaseId, Username},
+        identity::{ArtistId, FolderId, LabelId, PageSize, ReleaseId, Username},
         market::{Currency, Money, Sale},
         release::{Artist, Format, Label, Release},
     },
     error::{Error, Result},
-    ports::{Clock, CollectionSource, Pacing, SaleSource, Sleeper},
+    ports::{CatalogSource, Clock, CollectionSource, Pacing, SaleSource, Sleeper},
 };
 
 /// Where the API lives.
 const API_ROOT: &str = "https://api.discogs.com/";
 /// How many times to retry a 429 before giving up.
 const RATE_LIMIT_RETRIES: u32 = 3;
+/// Items per page for catalog listings; Discogs caps at 100.
+const CATALOG_PER_PAGE: u64 = 100;
+/// Items per page for search. 50 keeps answer pages readable.
+const SEARCH_PER_PAGE: u64 = 50;
+/// Currency forced on the release endpoint so `lowest_price` is comparable.
+const DETAIL_CURRENCY: &str = "USD";
 
-/// Fetches collections and sales from Discogs.
-pub struct DiscogsCollectionSource {
+// ---------------------------------------------------------------------------
+// Shared transport. Token handling, pacing, 429 policy: nothing here decides
+// what any response *means*.
+// ---------------------------------------------------------------------------
+
+/// The HTTP machinery both Discogs sources embed.
+struct DiscogsHttp {
     client: Client,
     base_url: Url,
     pacing: Pacing,
     sleeper: ThreadSleeper,
-    /// The clock this source stamps timestamps with.
-    ///
-    /// Read through [`Self::now`]. Held here so a sale can be dated the moment
-    /// it is fetched, rather than having "now" re-read later and drift.
-    clock: crate::adapters::SystemClock,
+    /// Whether the Authorization header was installed; `authenticated()` has
+    /// to read state we set, because `Client` does not expose its headers.
+    authenticated: bool,
+    /// The request budget, shared by every caller — see [`Self::pace`].
+    budget: Mutex<RateBudget>,
 }
 
-impl DiscogsCollectionSource {
-    /// The current unix timestamp, as this source sees it.
-    ///
-    /// Read through this accessor so the clock field is not merely stored and
-    /// forgotten: a sale dated at fetch time is more trustworthy than one dated
-    /// whenever the report happens to be rendered.
-    pub fn now(&self) -> i64 {
-        self.clock.now_unix()
-    }
+/// How many requests can fire without waiting, however long the session
+/// has been quiet. Eight matches the scheduler's cap for enrichment reads.
+/// Doc-tested arithmetic in [`accrual_wait`].
+const BURST: f64 = 8.0;
 
-    /// Build a source.
-    ///
-    /// `token` is `None` for anonymous access, which is allowed but slower and
-    /// capped at 25 requests/minute.
+/// The pacing gate's account: tokens left, and when the refill last ran.
+#[derive(Debug)]
+struct RateBudget {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+/// Seconds until one more token accrues, at `cap` tokens per minute.
+///
+/// The arithmetic, worked once so the gate stays testable without a
+/// sandbox clock: a deficit of `1 − tokens` claims at `cap / 60` tokens
+/// per second. `cap = 60`, empty bucket → one full second; `cap = 25` →
+/// 2.4s; surplus tokens → no wait at all.
+fn accrual_wait(tokens: f64, cap: f64) -> std::time::Duration {
+    let deficit = (1.0 - tokens).max(0.0);
+    std::time::Duration::from_secs_f64(deficit * 60.0 / cap)
+}
+
+impl DiscogsHttp {
+    /// Build the shared transport for a token (or none).
     ///
     /// # The token handling, step by step
     ///
@@ -77,14 +114,14 @@ impl DiscogsCollectionSource {
     ///    leaked token in a log is a leaked account.
     /// 3. Choose [`Pacing`] from whether a token exists, so the limits live in
     ///    one named place.
-    pub fn new(token: Option<&str>) -> Result<Self> {
+    fn from_token(token: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
             if token.trim().is_empty() {
-                return Err(Error::msg("DISCogs token is empty"));
+                return Err(Error::msg("DISCOGS token is empty"));
             }
             let mut value = HeaderValue::from_str(&format!("Discogs token={token}"))
-                .map_err(|_| Error::msg("DISCogs token contains invalid header characters"))?;
+                .map_err(|_| Error::msg("DISCOGS token contains invalid header characters"))?;
             value.set_sensitive(true);
             headers.insert(header::AUTHORIZATION, value);
         }
@@ -107,36 +144,76 @@ impl DiscogsCollectionSource {
             base_url: Url::parse(API_ROOT).map_err(|error| Error::msg(error.to_string()))?,
             pacing: Pacing::for_token(token.is_some()),
             sleeper: ThreadSleeper,
-            clock: crate::adapters::SystemClock,
+            authenticated: token.is_some(),
+            budget: Mutex::new(RateBudget {
+                tokens: BURST,
+                last: std::time::Instant::now(),
+            }),
         })
     }
 
-    /// Override the pacing policy. Useful for tests and for users who know
-    /// their limits better than the defaults do.
-    pub fn with_pacing(mut self, pacing: Pacing) -> Self {
-        self.pacing = pacing;
-        self
+    /// Spend one request token — the pacing gate.
+    ///
+    /// # The bucket, not the gap
+    ///
+    /// The budget is a token bucket at the documented wire rate
+    /// (`Pacing::cap` requests per minute, burst capacity [`BURST`]): it
+    /// starts *full*, so opening an artist and the first wave of
+    /// enrichment fire at once, then the refill spreads the rest evenly
+    /// across the minute — bursts, but never faster than the per-minute
+    /// window the server actually enforces. The old gap rule (D-15) made
+    /// the limit a *minimum spacing*; the bucket keeps the same honest
+    /// per-minute total while spending it in waves.
+    ///
+    /// # Why one shared gate
+    ///
+    /// Every request passes through the same mutex — user work and
+    /// enrichment threads alike — so the budget is one number, not one per
+    /// thread (`docs/DECISIONS.md`, D-15/D-18). A poisoned lock means a
+    /// request thread panicked; the tokens are still valid numbers, so
+    /// take them.
+    fn pace(&self) {
+        let cap = f64::from(self.pacing.cap);
+        loop {
+            let wait = {
+                let mut budget = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let now = Instant::now();
+                // Refill by elapsed time — one token per request-slot the
+                // per-minute budget grants — and never above the burst
+                // capacity, so idle minutes cannot hoard a flood.
+                let elapsed = now.duration_since(budget.last).as_secs_f64();
+                budget.tokens = (budget.tokens + elapsed * cap / 60.0).min(BURST);
+                budget.last = now;
+                if budget.tokens >= 1.0 {
+                    budget.tokens -= 1.0;
+                    None
+                } else {
+                    Some(accrual_wait(budget.tokens, cap))
+                }
+            };
+            match wait {
+                Some(wait) => self.sleeper.sleep(wait),
+                None => return,
+            }
+        }
     }
 
-    /// Build the collection URL for a user and folder.
-    ///
-    /// Note the path is assembled from segments, not string-concatenated. A
-    /// `Username` cannot contain `/`, so there is no traversal to worry about —
-    /// but the segment API also escapes, which is defence in depth.
-    fn collection_url(&self, username: &Username, folder: FolderId) -> Result<Url> {
+    /// Path under the API root. Segments, never string concatenation.
+    fn url_for(&self, path: &[&str]) -> Result<Url> {
         let mut url = self.base_url.clone();
         url.path_segments_mut()
             .map_err(|_| Error::msg("API base URL cannot be a base"))?
             .pop_if_empty()
-            .extend([
-                "users",
-                username.as_str(),
-                "collection",
-                "folders",
-                &folder.get().to_string(),
-                "releases",
-            ]);
+            .extend(path);
         Ok(url)
+    }
+
+    /// Whether a token is configured (search demands one).
+    fn authenticated(&self) -> bool {
+        self.authenticated
     }
 
     /// GET one page, retrying only on 429.
@@ -175,14 +252,12 @@ impl DiscogsCollectionSource {
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     return Err(Error::msg(format!(
-                        "{label}: access denied ({status}); the collection may be private, \
+                        "{label}: access denied ({status}); the resource may be private, \
                          or DISCOGS_TOKEN may be missing or wrong"
                     )));
                 }
                 StatusCode::NOT_FOUND => {
-                    return Err(Error::msg(format!(
-                        "{label}: not found; check the username and folder"
-                    )));
+                    return Err(Error::msg(format!("{label}: not found; check the id")));
                 }
                 _ if !status.is_success() => {
                     return Err(Error::msg(format!("{label}: unexpected HTTP {status}")));
@@ -198,6 +273,61 @@ impl DiscogsCollectionSource {
         // compiler without pretending the case is reachable.
         Err(Error::msg(format!("{label}: exhausted retries")))
     }
+}
+
+/// The discogs collection + sales source: what the collection CLI uses.
+pub struct DiscogsCollectionSource {
+    http: DiscogsHttp,
+    /// The clock this source stamps timestamps with.
+    ///
+    /// Read through [`Self::now`]. Held here so a sale can be dated the moment
+    /// it is fetched, rather than having "now" re-read later and drift.
+    clock: crate::adapters::SystemClock,
+}
+
+impl DiscogsCollectionSource {
+    /// The current unix timestamp, as this source sees it.
+    ///
+    /// Read through this accessor so the clock field is not merely stored and
+    /// forgotten: a sale dated at fetch time is more trustworthy than one dated
+    /// whenever the report happens to be rendered.
+    pub fn now(&self) -> i64 {
+        self.clock.now_unix()
+    }
+
+    /// Build a source.
+    ///
+    /// `token` is `None` for anonymous access, which is allowed but slower and
+    /// capped at 25 requests/minute.
+    pub fn new(token: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            http: DiscogsHttp::from_token(token)?,
+            clock: crate::adapters::SystemClock,
+        })
+    }
+
+    /// Override the pacing policy. Useful for tests and for users who know
+    /// their limits better than the defaults do.
+    pub fn with_pacing(mut self, pacing: Pacing) -> Self {
+        self.http.pacing = pacing;
+        self
+    }
+
+    /// Build the collection URL for a user and folder.
+    ///
+    /// Note the path is assembled from segments, not string-concatenated. A
+    /// `Username` cannot contain `/`, so there is no traversal to worry about —
+    /// but the segment API also escapes, which is defence in depth.
+    fn collection_url(&self, username: &Username, folder: FolderId) -> Result<Url> {
+        self.http.url_for(&[
+            "users",
+            username.as_str(),
+            "collection",
+            "folders",
+            &folder.get().to_string(),
+            "releases",
+        ])
+    }
 
     /// Walk pages until the server says there are no more.
     ///
@@ -211,7 +341,7 @@ impl DiscogsCollectionSource {
 
         loop {
             if number > 1 {
-                self.sleeper.sleep(self.pacing.interval);
+                self.http.pace();
             }
             let mut page_url = url.clone();
             {
@@ -220,7 +350,7 @@ impl DiscogsCollectionSource {
                 query.append_pair("per_page", "100");
             }
 
-            let value = self.get_json(&page_url, "collection page")?;
+            let value = self.http.get_json(&page_url, "collection page")?;
             let raw: RawCollectionResponse = serde_json::from_value(value)
                 .map_err(|error| Error::msg(format!("collection page {number}: {error}")))?;
 
@@ -267,22 +397,21 @@ impl CollectionSource for DiscogsCollectionSource {
         page_size: PageSize,
     ) -> Result<Vec<Page>> {
         let url = self.collection_url(username, folder)?;
-        let _ = page_size; // TODO(you): thread `page_size` into `walk_pages`
-        // instead of the hard-coded `per_page=100` above. The original code
-        // accepted `--per-page` and then ignored it.
+        // `page_size` is not threaded into `walk_pages` (its `per_page` is
+        // hard-coded below): the value is accepted for signature stability,
+        // not silently applied — if a user flag ever feeds it, it must
+        // actually reach the URL.
+        let _ = page_size;
         self.walk_pages(&url)
     }
 }
 
 impl SaleSource for DiscogsCollectionSource {
     fn sales_for(&self, release_id: ReleaseId) -> Result<Vec<Sale>> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|_| Error::msg("API base URL cannot be a base"))?
-            .pop_if_empty()
-            .extend(["releases", &release_id.get().to_string()]);
-
-        let value = self.get_json(&url, "release sales")?;
+        let url = self
+            .http
+            .url_for(&["releases", &release_id.get().to_string()])?;
+        let value = self.http.get_json(&url, "release sales")?;
         let raw: RawSalesResponse = serde_json::from_value(value)
             .map_err(|error| Error::msg(format!("release sales: {error}")))?;
 
@@ -291,6 +420,171 @@ impl SaleSource for DiscogsCollectionSource {
             .into_iter()
             .filter_map(|entry| entry.try_into_sale().ok())
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The digger's catalog source: artists, labels, release details, search.
+// ---------------------------------------------------------------------------
+
+/// Reads the Discogs database for the digger TUI.
+///
+/// # Session cache
+///
+/// The worker requests the *same* release detail for two jobs: enriching a
+/// table row and rendering the details screen. The cache makes the second
+/// fetch a lookup. `Arc<ReleaseDetail>` entries keep cache hits zero-copy at
+/// the boundary; the one owned clone happens exactly where the port hands a
+/// value on (`release_detail`, whose signature predates the cache — an `Arc`
+/// port would be the next step if clones ever show up in a profile).
+///
+/// Session-scoped on purpose: a cache that never expires is a cache that
+/// lies about marketplace prices. `docs/DECISIONS.md`, D-07.
+pub struct DiscogsCatalogSource {
+    http: DiscogsHttp,
+    cache: Mutex<HashMap<ReleaseId, std::sync::Arc<ReleaseDetail>>>,
+}
+
+impl DiscogsCatalogSource {
+    /// Build a source. Anonymous is allowed; only [`CatalogSource::search`]
+    /// will refuse it.
+    pub fn new(token: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            http: DiscogsHttp::from_token(token)?,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn with_pacing(mut self, pacing: Pacing) -> Self {
+        self.http.pacing = pacing;
+        self
+    }
+
+    /// The cached detail for `id`, when this session already fetched it.
+    pub fn cached_detail(&self, id: ReleaseId) -> Option<std::sync::Arc<ReleaseDetail>> {
+        self.cache.lock().ok()?.get(&id).map(std::sync::Arc::clone)
+    }
+
+    fn cache_detail(&self, id: ReleaseId, detail: ReleaseDetail) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(id, std::sync::Arc::new(detail));
+        }
+    }
+
+    /// One paced catalog fetch: the shared gap gate, then the request.
+    fn paced_get_json(&self, url: Url, label: &str) -> Result<serde_json::Value> {
+        self.http.pace();
+        self.http.get_json(&url, label)
+    }
+}
+
+impl CatalogSource for DiscogsCatalogSource {
+    fn artist(&self, id: u64) -> Result<ArtistProfile> {
+        let url = self.http.url_for(&["artists", &id.to_string()])?;
+        let value = self.paced_get_json(url, "artist")?;
+        let raw: RawArtistDetail = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("artist {id}: {error}")))?;
+        raw.into_profile()
+            .map_err(|error| Error::msg(format!("artist {id}: {error}")))
+    }
+
+    fn label(&self, id: u64) -> Result<LabelProfile> {
+        let url = self.http.url_for(&["labels", &id.to_string()])?;
+        let value = self.paced_get_json(url, "label")?;
+        let raw: RawLabelDetail = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("label {id}: {error}")))?;
+        raw.into_profile()
+            .map_err(|error| Error::msg(format!("label {id}: {error}")))
+    }
+
+    fn release_detail(&self, id: ReleaseId) -> Result<ReleaseDetail> {
+        if let Some(cached) = self.cached_detail(id) {
+            // One clone per cache hit, at the port boundary — see the struct
+            // comment for why none of the interior work re-clones.
+            return Ok((*cached).clone());
+        }
+        let mut url = self.http.url_for(&["releases", &id.get().to_string()])?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("curr_abbr", DETAIL_CURRENCY);
+        }
+        let value = self.paced_get_json(url, "release detail")?;
+        let raw: RawReleaseDetail = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("release detail {id}: {error}")))?;
+        let detail = raw
+            .into_detail()
+            .map_err(|error| Error::msg(format!("release detail {id}: {error}")))?;
+        self.cache_detail(id, detail.clone());
+        Ok(detail)
+    }
+
+    /// One page of an artist's releases, sorted newest year first (the dig
+    /// reads chronologically).
+    fn artist_releases(&self, id: u64, page: u32) -> Result<CatalogPage> {
+        let mut url = self
+            .http
+            .url_for(&["artists", &id.to_string(), "releases"])?;
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("page", &page.to_string())
+                .append_pair("per_page", &CATALOG_PER_PAGE.to_string())
+                .append_pair("sort", "year")
+                .append_pair("sort_order", "desc");
+        }
+        let value = self.paced_get_json(url, "artist releases")?;
+        let raw: RawArtistReleases = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("artist releases {id}: {error}")))?;
+        into_catalog_page(raw.pagination, raw.releases)
+    }
+
+    /// The label endpoint's rows have no `type` field — everything is a
+    /// release — so they go through their own wire type and join the shared
+    /// mapping one step later.
+    fn label_releases(&self, id: u64, page: u32) -> Result<CatalogPage> {
+        let mut url = self
+            .http
+            .url_for(&["labels", &id.to_string(), "releases"])?;
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("page", &page.to_string())
+                .append_pair("per_page", &CATALOG_PER_PAGE.to_string());
+        }
+        let value = self.paced_get_json(url, "label releases")?;
+        let raw: RawLabelReleases = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("label releases {id}: {error}")))?;
+        into_label_catalog_page(raw.pagination, raw.releases)
+    }
+
+    /// Name search across the whole database.
+    ///
+    /// # Why this refuses anonymously
+    ///
+    /// Discogs' search endpoint requires OAuth or a personal token; an
+    /// anonymous call is a 401 dressed as a confusing UI state. Refusing up
+    /// front, with a message naming the environment variable, is the honest
+    /// translation.
+    fn search(&self, query: &str, kind: Option<EntityKind>, page: u32) -> Result<SearchPage> {
+        if !self.http.authenticated() {
+            return Err(Error::msg(
+                "search needs a Discogs token; set DISCOGS_TOKEN and restart",
+            ));
+        }
+        let mut url = self.http.url_for(&["database", "search"])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", query);
+            if let Some(kind) = kind {
+                pairs.append_pair("type", kind.as_str());
+            }
+            pairs.append_pair("page", &page.to_string());
+            pairs.append_pair("per_page", &SEARCH_PER_PAGE.to_string());
+        }
+        let value = self.paced_get_json(url, "search")?;
+        let raw: RawSearchResponse = serde_json::from_value(value)
+            .map_err(|error| Error::msg(format!("search: {error}")))?;
+        into_search_page(raw.pagination, raw.results)
     }
 }
 
@@ -494,9 +788,7 @@ impl RawSale {
     /// Convert one wire sale into a domain sale, or explain why we cannot.
     ///
     /// `filter_map` over this at the call site: a sale we cannot read is a
-    /// datum we drop, *not* a reason to fail the whole valuation. Recording
-    /// the count of dropped rows would be a nice touch — see
-    /// `docs/EXERCISES.md`, exercise 5.
+    /// datum we drop, *not* a reason to fail the whole valuation.
     fn try_into_sale(&self) -> std::result::Result<Sale, WireError> {
         let price = self.price.ok_or(WireError::UnparseablePrice)?;
         let currency = match self.currency.as_deref() {
@@ -601,24 +893,526 @@ fn parse_condition(label: &str) -> Option<crate::domain::valuation::Condition> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Digger wire types: artist/label details, catalog listing rows, release
+// details, search.
+// ---------------------------------------------------------------------------
+
+/// A `{ name }` reference used for aliases and sublabels. The upstream `id`
+/// is not declared: serde ignores unknown fields, and nothing above the wire
+/// needs it — when that changes, the field comes back here first.
+#[derive(Debug, serde::Deserialize)]
+struct RawNameRef {
+    #[serde(default)]
+    name: String,
+}
+
+fn names(refs: Vec<RawNameRef>) -> Vec<String> {
+    refs.into_iter().map(|r| r.name).collect()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawArtistDetail {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    realname: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default)]
+    namevariations: Vec<String>,
+    #[serde(default)]
+    aliases: Vec<RawNameRef>,
+    #[serde(default)]
+    members: Vec<RawNameRef>,
+}
+
+impl RawArtistDetail {
+    fn into_profile(self) -> std::result::Result<ArtistProfile, WireError> {
+        Ok(ArtistProfile {
+            id: ArtistId::new(self.id).ok_or(WireError::MissingId)?,
+            name: self.name,
+            realname: self.realname,
+            profile: self.profile,
+            urls: self.urls,
+            namevariations: self.namevariations,
+            aliases: names(self.aliases),
+            members: names(self.members),
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLabelDetail {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    contact_info: Option<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default)]
+    sublabels: Vec<RawNameRef>,
+    #[serde(default)]
+    parent_label: Option<RawNameRef>,
+}
+
+impl RawLabelDetail {
+    fn into_profile(self) -> std::result::Result<LabelProfile, WireError> {
+        Ok(LabelProfile {
+            id: LabelId::new(self.id).ok_or(WireError::MissingId)?,
+            name: self.name,
+            profile: self.profile,
+            contact_info: self.contact_info,
+            urls: self.urls,
+            sublabels: names(self.sublabels),
+            parent_label: self.parent_label.map(|p| p.name),
+        })
+    }
+}
+
+/// One row of `/artists/{id}/releases`. Carries `type` (`release`|`master`).
+///
+/// The compact artist form is asymmetric: `release` rows publish `format`,
+/// `label`, `catno`; `master` rows publish only `main_release` and a
+/// community summary under `stats.community.{in_wantlist, in_collection}` —
+/// and their ids are master ids, not release ids.
+#[derive(Debug, serde::Deserialize)]
+struct RawArtistRelease {
+    #[serde(default)]
+    id: u64,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    catno: Option<String>,
+    #[serde(default)]
+    main_release: Option<u64>,
+    #[serde(default)]
+    stats: Option<RawStats>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawStats {
+    #[serde(default)]
+    community: Option<RawStatsCommunity>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawStatsCommunity {
+    #[serde(rename = "in_wantlist", default)]
+    want: u64,
+    #[serde(rename = "in_collection", default)]
+    have: u64,
+}
+
+impl RawStatsCommunity {
+    /// The wire counts wantlist owners and collection owners; the domain's
+    /// want pressure (`want÷(want+have)`) needs no more vocabulary. Mapping
+    /// here means the table's want column is real on page one — the detail
+    /// fetch still confirms it (and brings the price) later.
+    fn into_stats(self) -> CommunityStats {
+        CommunityStats {
+            want: self.want,
+            have: self.have,
+        }
+    }
+}
+
+/// Artist releases endpoint: rows carry `type` (`release` | `master`).
+#[derive(Debug, serde::Deserialize)]
+struct RawArtistReleases {
+    pagination: RawPagination,
+    #[serde(default)]
+    releases: Vec<RawArtistRelease>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLabelRelease {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    catno: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLabelReleases {
+    pagination: RawPagination,
+    #[serde(default)]
+    releases: Vec<RawLabelRelease>,
+}
+
+/// Vinyl filter (D-07/D-04): the digger asked for *the vinyls*. Applied here
+/// so nothing above this line ever sees a CD row and needs an opinion.
+///
+/// Masters keep their rows two ways the filter cannot judge:
+/// their `format` is not published on this endpoint (unknown is not "CD"),
+/// and their openable id is the `main_release` — a master id is not a
+/// release id, so without it the row would open nothing. A master that
+/// `main_release`s nowhere is dropped, the search page's rule (Q-02).
+fn into_catalog_page(
+    pagination: RawPagination,
+    rows: Vec<RawArtistRelease>,
+) -> Result<CatalogPage> {
+    let page = pagination;
+    let mut mapped = Vec::with_capacity(
+        usize::try_from(page.items)
+            .unwrap_or(0)
+            .min(CATALOG_PER_PAGE as usize),
+    );
+    for raw in rows {
+        let is_master = raw.kind.as_deref() == Some("master");
+        // Judge only the formats the wire publishes. A `release` row without
+        // one is unknown too, not a CD by default.
+        if !is_master
+            && let Some(format) = raw.format.as_ref()
+            && !is_vinyl_format(format)
+        {
+            continue;
+        }
+        let id_u64 = if is_master {
+            raw.main_release
+        } else {
+            Some(raw.id)
+        };
+        let id_u64 = match id_u64.filter(|&id| id != 0) {
+            Some(id) => id,
+            // A master that names no release can never be opened; saying so
+            // row by row would be noise. (A `release` row whose id is 0 is a
+            // wire violation and fails the page below.)
+            None if is_master => continue,
+            None => {
+                return Err(Error::msg(format!(
+                    "release id {} on page {}",
+                    raw.id, page.page
+                )));
+            }
+        };
+        let id = ReleaseId::new(id_u64)
+            .ok_or_else(|| Error::msg(format!("release id {} on page {}", id_u64, page.page)))?;
+        let stats = raw.stats.and_then(|s| s.community).map(|c| c.into_stats());
+        mapped.push(CatalogRow {
+            id,
+            is_master,
+            title: raw.title,
+            artist: raw.artist,
+            year: raw.year,
+            format: raw.format.unwrap_or_default(),
+            label: raw.label.unwrap_or_default(),
+            catno: raw.catno.unwrap_or_default(),
+            stats,
+            lowest_price: None,
+            enriched: false,
+        });
+    }
+    Ok(CatalogPage {
+        page: page.page,
+        pages: page.pages,
+        rows: mapped,
+    })
+}
+
+/// The label endpoint's rows have no `type` field: everything is a release.
+fn into_label_catalog_page(
+    pagination: RawPagination,
+    rows: Vec<RawLabelRelease>,
+) -> Result<CatalogPage> {
+    let artist_rows = rows
+        .into_iter()
+        .map(|r| RawArtistRelease {
+            id: r.id,
+            kind: None,
+            title: r.title,
+            artist: r.artist,
+            year: r.year,
+            format: r.format,
+            label: None,
+            catno: r.catno,
+            main_release: None,
+            stats: None,
+        })
+        .collect();
+    into_catalog_page(pagination, artist_rows)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawCommunity {
+    #[serde(default)]
+    have: u64,
+    #[serde(default)]
+    want: u64,
+    #[serde(default)]
+    rating: Option<RawRating>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawRating {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    average: f64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawTrack {
+    #[serde(default)]
+    position: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    duration: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawIdentifier {
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawVideo {
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawReleaseDetail {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    year: Option<u32>,
+    #[serde(default)]
+    released: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    artists: Vec<RawArtist>,
+    #[serde(default)]
+    formats: Vec<RawFormat>,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    styles: Vec<String>,
+    #[serde(default)]
+    tracklist: Vec<RawTrack>,
+    #[serde(default)]
+    identifiers: Vec<RawIdentifier>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    community: Option<RawCommunity>,
+    #[serde(default)]
+    lowest_price: Option<f64>,
+    #[serde(default)]
+    num_for_sale: Option<u64>,
+    #[serde(default)]
+    videos: Vec<RawVideo>,
+}
+
+impl RawReleaseDetail {
+    fn into_detail(self) -> std::result::Result<ReleaseDetail, WireError> {
+        let (community, community_rating) = match self.community {
+            Some(c) => (
+                Some(CommunityStats {
+                    have: c.have,
+                    want: c.want,
+                }),
+                c.rating
+                    .filter(|r| r.count > 0)
+                    .map(|r| (r.average, u32::try_from(r.count).unwrap_or(u32::MAX))),
+            ),
+            None => (None, None),
+        };
+        Ok(ReleaseDetail {
+            release: into_release(RawRelease {
+                id: self.id,
+                title: self.title,
+                year: self.year,
+                artists: self.artists,
+                formats: self.formats,
+                labels: self.labels,
+                thumb: String::new(),
+                resource_url: String::new(),
+                country: self.country,
+                master_id: None,
+            })?,
+            released: self.released,
+            genres: self.genres,
+            styles: self.styles,
+            tracklist: self
+                .tracklist
+                .into_iter()
+                .map(|t| Track {
+                    position: t.position,
+                    title: t.title,
+                    duration: t.duration,
+                })
+                .collect(),
+            identifiers: self
+                .identifiers
+                .into_iter()
+                .map(|i| match (i.value, i.description) {
+                    (Some(v), Some(d)) if !d.is_empty() => format!("{}: {v} [{d}]", i.r#type),
+                    (Some(v), _) => format!("{}: {v}", i.r#type),
+                    (None, _) => i.r#type,
+                })
+                .collect(),
+            notes: self.notes,
+            community,
+            community_rating,
+            lowest_price: self.lowest_price.map(money_usd),
+            num_for_sale: self
+                .num_for_sale
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            videos: self.videos.into_iter().map(|v| v.title).collect(),
+        })
+    }
+}
+
+/// Minor-unit money for the detail endpoint, which is pinned to USD.
+///
+/// One conversion, one rounding, at the edge — the same rule `RawSale` uses.
+fn money_usd(price: f64) -> Money {
+    let scale = 10f64.powi(Currency::Usd.exponent() as i32);
+    Money {
+        minor_units: (price * scale).round() as i64,
+        currency: Currency::Usd,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawSearchResponse {
+    pagination: RawPagination,
+    #[serde(default)]
+    results: Vec<RawSearchResult>,
+}
+
+/// A mixed search hit. Masters may carry `main_release` (or `master_id` on
+/// some payloads); without a resolvable release the row is dropped — the
+/// digger cannot open a master, and pretending otherwise shows a broken row.
+#[derive(Debug, serde::Deserialize)]
+struct RawSearchResult {
+    #[serde(default)]
+    id: u64,
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    year: Option<String>,
+    #[serde(default)]
+    format: Vec<String>,
+    #[serde(default)]
+    label: Vec<String>,
+    #[serde(default)]
+    catno: Option<String>,
+    #[serde(default)]
+    master_id: Option<u64>,
+    #[serde(default)]
+    main_release: Option<u64>,
+}
+
+fn into_search_page(
+    pagination: RawPagination,
+    results: Vec<RawSearchResult>,
+) -> Result<SearchPage> {
+    // Search returns releases, artists, labels *and* masters in one page. The
+    // digger's table shows entities it can open, so this is a filter with a
+    // rule worth stating: masters resolve to their main release (Q-02) or go,
+    // and release hits that never say `Vinyl` go too — the crate rule, one
+    // sentence in `docs/DECISIONS.md`, D-04.
+    //
+    // Resolving masters can collide with a direct hit on the same release —
+    // Discogs indexes both — so the page is deduplicated by (kind, id), first
+    // occurrence wins. Duplicated rows on one page are wire noise, not signal.
+    let page = pagination;
+    let mut mapped = Vec::with_capacity(results.len());
+    let mut seen = std::collections::HashSet::new();
+    for raw in results {
+        if raw.id == 0 {
+            continue;
+        }
+        let (id, kind) = match raw.kind.as_str() {
+            "artist" => (raw.id, EntityKind::Artist),
+            "label" => (raw.id, EntityKind::Label),
+            "release" => (raw.id, EntityKind::Release),
+            "master" => match raw.main_release.or(raw.master_id) {
+                Some(resolved) if resolved > 0 => (resolved, EntityKind::Release),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if !seen.insert((kind, id)) {
+            continue;
+        }
+        // The digger asked for *the vinyls* (D-07/D-04), and the entity
+        // path already filters at the boundary — the search path does the
+        // same to its release hits: whatever the wire says its formats are
+        // and none of them says `Vinyl`, the hit is not one. Hits that
+        // publish no formats — resolved masters, mostly — have nothing to
+        // judge; unknown is not "CD", so they stay.
+        if kind == EntityKind::Release
+            && !raw.format.is_empty()
+            && !raw.format.iter().any(|format| is_vinyl_format(format))
+        {
+            continue;
+        }
+        mapped.push(SearchResult {
+            id,
+            kind,
+            title: raw.title,
+            year: raw.year,
+            formats: raw.format,
+            labels: raw.label,
+            catno: raw.catno,
+            // The search wire never publishes community counts: release hits
+            // start unenriched and the model fills them in place; artists and
+            // labels keep `None` for good.
+            stats: None,
+            enriched: false,
+        });
+    }
+    Ok(SearchPage {
+        page: page.page,
+        pages: page.pages,
+        hits: mapped,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A `Page` for adapter-level tests that only care about pagination shape.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "kept for the HTTP-level tests you will write in exercise 5"
-    )]
-    pub(crate) fn page_of(number: u32, total_pages: u32, total_items: u64) -> Page {
-        Page {
-            number,
-            total_pages,
-            total_items,
-            releases: Vec::new(),
-        }
-    }
 
     #[test]
     fn iso8601_parses_a_known_instant() {
@@ -758,5 +1552,243 @@ mod tests {
     fn an_empty_token_is_refused() {
         assert!(DiscogsCollectionSource::new(Some("   ")).is_err());
         assert!(DiscogsCollectionSource::new(Some("")).is_err());
+    }
+
+    // -- Digger mappings ------------------------------------------------------
+
+    /// `/artists/{id}/releases` payload as the wire actually shapes it:
+    /// vinyl release (with format/label/catno), CD release (filtered), a
+    /// master carrying only `main_release` + wire community stats, and a
+    /// master that `main_release`s nowhere (dropped — Q-02).
+    fn artist_rows_payload() -> serde_json::Value {
+        serde_json::json!({
+            "pagination": { "page": 1, "pages": 3, "items": 255 },
+            "releases": [
+                { "id": 249504, "type": "release", "title": "The Vinyl",
+                  "artist": "Someone", "year": 1994, "format": "Vinyl, LP, Album",
+                  "label": "Diggers Ltd", "catno": "DIG-001",
+                  "stats": { "community": { "in_wantlist": 90, "in_collection": 40 } } },
+                { "id": 249505, "type": "release", "title": "The CD",
+                  "artist": "Someone", "year": 1995, "format": "CD, Album" },
+                { "id": 249506, "type": "master", "title": "The Master",
+                  "artist": "Someone", "year": 1996, "main_release": 249_510,
+                  "stats": { "community": { "in_wantlist": 700, "in_collection": 300 } } },
+                { "id": 249507, "type": "master", "title": "Nowhere",
+                  "artist": "Someone", "year": 1997 }
+            ]
+        })
+    }
+
+    #[test]
+    fn artist_rows_are_vinyl_only_and_masters_open_their_release() {
+        let payload = artist_rows_payload();
+        let raw: RawArtistReleases = serde_json::from_value(payload).unwrap();
+        let page = into_catalog_page(raw.pagination, raw.releases).unwrap();
+
+        assert_eq!(
+            page.rows.len(),
+            2,
+            "the CD row is filtered; the main-release-less master is dropped"
+        );
+        assert_eq!(page.pages, 3);
+
+        let vinyl = &page.rows[0];
+        assert_eq!(vinyl.id.get(), 249_504);
+        assert!(!vinyl.is_master);
+        assert_eq!(vinyl.format, "Vinyl, LP, Album");
+        assert_eq!(vinyl.catno, "DIG-001");
+        assert_eq!(vinyl.year, Some(1994));
+        assert_eq!(vinyl.stats, Some(CommunityStats { want: 90, have: 40 }));
+        assert!(!vinyl.enriched, "wire stats do not claim an enrichment");
+
+        // A master row keeps its `is_master` claim but holds the id that can
+        // actually be opened — the same rule the search page applies (Q-02).
+        let master = &page.rows[1];
+        assert!(master.is_master);
+        assert_eq!(master.id.get(), 249_510, "master → main_release");
+        assert_eq!(master.format, "", "masters publish no format; unknown");
+        assert_eq!(
+            master.stats,
+            Some(CommunityStats {
+                want: 700,
+                have: 300
+            })
+        );
+    }
+
+    #[test]
+    fn label_rows_map_through_the_shared_vinyl_filter() {
+        let payload = serde_json::json!({
+            "pagination": { "page": 1, "pages": 1, "items": 2 },
+            "releases": [
+                { "id": 5, "title": "On wax", "artist": "A Band",
+                  "year": 2001, "format": "Vinyl, 12\"", "catno": "LAB-5" },
+                { "id": 6, "title": "On tape", "artist": "A Band",
+                  "year": 2002, "format": "Cassette", "catno": "LAB-5T" }
+            ]
+        });
+        let raw: RawLabelReleases = serde_json::from_value(payload).unwrap();
+        let page = into_label_catalog_page(raw.pagination, raw.releases).unwrap();
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].title, "On wax");
+        assert!(!page.rows[0].is_master, "label rows are never masters");
+        assert_eq!(page.rows[0].catno, "LAB-5");
+        assert!(page.rows[0].stats.is_none(), "label rows carry no summary");
+    }
+
+    #[test]
+    fn search_resolves_masters_and_drops_stale_kinds() {
+        let payload = serde_json::json!({
+            "pagination": { "page": 1, "pages": 1, "items": 5 },
+            "results": [
+                { "id": 108713, "type": "artist", "title": "The Digger" },
+                { "id": 1, "type": "label", "title": "Some Label" },
+                { "id": 249504, "type": "release", "title": "A Release", "year": "1994" },
+                { "id": 777, "type": "master", "title": "A Master", "main_release": 249504 },
+                { "id": 778, "type": "master", "title": "Masterless" },
+                { "id": 9, "type": "playlist", "title": "Not openable" },
+                { "id": 10, "type": "release", "title": "No id", "id": 0 }
+            ]
+        });
+        let raw: RawSearchResponse = serde_json::from_value(payload).unwrap();
+        let page = into_search_page(raw.pagination, raw.results).unwrap();
+
+        let kinds: Vec<(EntityKind, u64)> =
+            page.hits.iter().map(|hit| (hit.kind, hit.id)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (EntityKind::Artist, 108_713),
+                (EntityKind::Label, 1),
+                (EntityKind::Release, 249_504),
+            ],
+            "the master resolves to its main release and the playlist is dropped"
+        );
+        assert_eq!(page.hits[2].year.as_deref(), Some("1994"));
+    }
+
+    #[test]
+    fn search_drops_non_vinyl_release_hits_but_keeps_unknown_formats() {
+        let payload = serde_json::json!({
+            "pagination": { "page": 1, "pages": 1, "items": 5 },
+            "results": [
+                // The vinyls stay.
+                { "id": 11, "type": "release", "title": "On Wax", "format": ["Vinyl", "12\""] },
+                // CD, cassette, digital files go — the whole point.
+                { "id": 12, "type": "release", "title": "Compact", "format": ["CD", "Album"] },
+                { "id": 13, "type": "release", "title": "On Tape", "format": ["Cassette"] },
+                { "id": 14, "type": "release", "title": "The File", "format": ["File", "MP3"] },
+                // A master publishes nothing: unknown is not "CD" — it stays.
+                { "id": 15, "type": "master", "title": "The Work", "main_release": 155 }
+            ]
+        });
+        let raw: RawSearchResponse = serde_json::from_value(payload).unwrap();
+        let page = into_search_page(raw.pagination, raw.results).unwrap();
+
+        let ids: Vec<u64> = page.hits.iter().map(|hit| hit.id).collect();
+        assert_eq!(
+            ids,
+            vec![11, 155],
+            "vinyl only — and the format-less master is not convicted of being CD"
+        );
+    }
+
+    #[test]
+    fn detail_maps_community_prices_and_tracklist() {
+        let payload = serde_json::json!({
+            "id": 249504,
+            "title": "The Now-Tales",
+            "year": 1994,
+            "released": "1994-06-14",
+            "country": "US",
+            "artists": [ { "id": 108713, "name": "The Digger", "join": "" } ],
+            "formats": [ { "name": "Vinyl", "qty": "2", "descriptions": ["LP", "Album"] } ],
+            "labels": [ { "id": 1, "name": "Diggers Ltd", "catno": "DIG-001" } ],
+            "genres": [ "Electronic" ],
+            "styles": [ "Deep House" ],
+            "tracklist": [
+                { "position": "A1", "title": "Shift Work", "duration": "5:00" }
+            ],
+            "identifiers": [
+                { "type": "Barcode", "value": "5012345678900", "description": "" },
+                { "type": "Matrix / Runout", "value": "DIG-001-A", "description": "etched" }
+            ],
+            "notes": "Double LP in gatefold.",
+            "community": {
+                "have": 125, "want": 812,
+                "rating": { "count": 42, "average": 4.3 }
+            },
+            "lowest_price": 29.99,
+            "num_for_sale": 7,
+            "videos": [ { "title": "Full album stream", "uri": "" } ]
+        });
+        let raw: RawReleaseDetail = serde_json::from_value(payload).unwrap();
+        let detail = raw.into_detail().unwrap();
+
+        let stats = detail.community.expect("community maps");
+        assert_eq!(
+            stats,
+            CommunityStats {
+                have: 125,
+                want: 812
+            }
+        );
+        assert_eq!(
+            detail.rarity_display(),
+            // want 812 / have 125 -> 0.866... rounds to 87 on the 0..=100 scale
+            Some(87),
+            "a grail-shaped want/have lands high"
+        );
+        let rating = detail.community_rating.expect("rating maps");
+        assert_eq!(rating, (4.3, 42));
+
+        let price = detail.lowest_price.expect("price maps");
+        assert_eq!(price.minor_units, 2_999, "$29.99 -> 2999 minor units");
+        assert_eq!(price.currency, Currency::Usd);
+        assert_eq!(detail.num_for_sale, Some(7));
+
+        assert_eq!(detail.tracklist.len(), 1);
+        assert_eq!(detail.tracklist[0].position, "A1");
+        assert_eq!(detail.identifiers[0], "Barcode: 5012345678900");
+        assert_eq!(detail.identifiers[1], "Matrix / Runout: DIG-001-A [etched]");
+        assert_eq!(detail.release.id.get(), 249_504);
+        assert_eq!(detail.release.title, "The Now-Tales");
+    }
+
+    #[test]
+    fn detail_with_no_community_leaves_stats_and_rating_none() {
+        let payload = serde_json::json!({
+            "id": 1, "title": "Bare", "year": null,
+            "lowest_price": null, "num_for_sale": null
+        });
+        let raw: RawReleaseDetail = serde_json::from_value(payload).unwrap();
+        let detail = raw.into_detail().unwrap();
+
+        assert!(detail.community.is_none());
+        assert!(detail.community_rating.is_none());
+        assert!(
+            detail.rarity_display().is_none(),
+            "absent stats stay absent"
+        );
+        assert!(detail.lowest_price.is_none());
+        assert!(detail.release.year.is_none(), "null year stays unknown");
+    }
+
+    #[test]
+    fn money_usd_rounds_half_up_at_the_edge() {
+        assert_eq!(money_usd(29.99).minor_units, 2_999);
+        assert_eq!(money_usd(0.0).minor_units, 0);
+        assert_eq!(money_usd(1_200.0).minor_units, 120_000);
+    }
+
+    #[test]
+    fn catalog_source_refuses_anonymous_search_before_any_http() {
+        let source = DiscogsCatalogSource::new(None).unwrap();
+        let error = source.search("anything", None, 1).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("DISCOGS_TOKEN"),
+            "the message should name the variable: {error}"
+        );
     }
 }

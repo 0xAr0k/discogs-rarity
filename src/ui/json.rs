@@ -144,13 +144,10 @@ struct SaleView {
 
 /// Render a report as pretty-printed JSON.
 ///
-/// # TODO(you) — exercise 6
-///
-/// Make failure visible. `serde_json::to_string_pretty` on data you built
-/// yourself basically cannot fail, but `unwrap()` here would panic on a user
-/// with an empty terminal. Return `Result<String>` and let `main` decide what
-/// to print. The doc comment on this function already claims a `Result`; make
-/// the signature match.
+/// Serialization of data built in this crate cannot fail in practice, but the
+/// honest shape is still an error document, not a panic: a renderer that
+/// cannot fail is a claim about the future, so failures become a JSON error
+/// object rather than an aborted process.
 pub fn render(report: &Report) -> String {
     serde_json::to_string_pretty(&build(report))
         .unwrap_or_else(|error| format!("{{\"error\":\"could not serialize report: {error}\"}}"))

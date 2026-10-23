@@ -11,10 +11,12 @@
 
 pub mod discogs;
 pub mod system;
+pub mod wantlist;
 
 // Test doubles are compiled unconditionally so that integration tests and
 // example code can use them, not only the unit tests inside this crate.
 pub mod testing;
 
-pub use discogs::DiscogsCollectionSource;
+pub use discogs::{DiscogsCatalogSource, DiscogsCollectionSource};
 pub use system::{SystemClock, ThreadSleeper};
+pub use wantlist::JsonWantlist;

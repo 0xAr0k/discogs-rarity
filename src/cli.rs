@@ -91,12 +91,10 @@ impl Args {
 
 /// The token to use, if any.
 ///
-/// # TODO(you) — exercise 7
-///
-/// Today `run_discogs` reads the environment itself, which makes the
-/// environment part of its behaviour and therefore untestable. Return the
-/// token from here instead, thread it through `app::run_discogs(token, request)`,
-/// and the function becomes testable with a fake. Small change, real gain.
+/// A testability note for later: `run_discogs` reads the environment itself,
+/// which makes the environment part of its behaviour and therefore untestable.
+/// Threading the token through `app::run_discogs(token, request)` would make
+/// the anonymous/authenticated pacing split testable with a fake.
 pub fn token_from(args: &Args) -> Option<&str> {
     args.token
         .as_deref()

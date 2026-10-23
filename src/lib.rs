@@ -29,13 +29,6 @@
 //! A dependency pointing the "wrong" way (e.g. `domain` importing `reqwest`)
 //! is a bug even if the code compiles. The whole point of the ports seam is
 //! that [`domain`] stays compilable, testable, and readable on its own.
-//!
-//! # Ownership of the unfinished parts
-//!
-//! [`domain::rarity`], [`domain::market`], and [`domain::valuation`] contain
-//! deliberately unimplemented functions marked with `TODO(you)`. Those are
-//! yours to write — see `docs/EXERCISES.md` for the prompts, the tests that
-//! already gate them, and the hints.
 
 pub mod adapters;
 pub mod app;
@@ -43,6 +36,7 @@ pub mod cli;
 pub mod domain;
 pub mod error;
 pub mod ports;
+pub mod tui;
 pub mod ui;
 
 /// Crate version, used for the HTTP `User-Agent` and the CLI banner.

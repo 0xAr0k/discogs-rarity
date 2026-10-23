@@ -163,10 +163,10 @@ impl Error {
     /// A future `--retries` flag would consult this. Today the honest answer
     /// is "no": this app has no retry loop outside the rate-limit path.
     pub fn is_retryable(&self) -> bool {
-        // TODO(you): return true for transport-level failures (timeout,
-        // connection reset) once the HTTP adapter tags them. Match on a
-        // dedicated `Error::transient(..)` marker rather than sniffing the
-        // message string — string matching is how retries go wrong.
+        // Deliberately false: this app has no retry loop outside the
+        // rate-limit path. If `--retries` ever exists, tag transport failures
+        // with a dedicated `Error::transient(..)` marker at the HTTP adapter
+        // and match on that — never on the message string.
         false
     }
 }

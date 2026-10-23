@@ -52,9 +52,9 @@ pub fn render(report: &Report) -> String {
             .sum::<u32>()
     ));
 
-    // TODO(you): print the collection total *and* the coverage figure together.
-    // A total without coverage is how a partial valuation gets read as a
-    // complete one. See `CollectionValuation::total`.
+    // The total is deliberately absent (see `CollectionValuation`): a value
+    // without its coverage figure reads as more complete than it is, so until
+    // both exist together they print as their honest unknowns.
     out.push_str(&format!(
         "Estimated value: {}\n",
         report

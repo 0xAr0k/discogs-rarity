@@ -111,7 +111,8 @@ impl Format {
     ///
     /// Digital entries in a physical collection are usually mistakes, and they
     /// distort both value and rarity. This is a first cut, not a rule set:
-    /// see `docs/EXERCISES.md`, exercise 4.
+    /// opening the list to every carrier the wire can name is a decision for
+    /// when a real collection does it to us.
     pub fn is_physical(&self) -> bool {
         const DIGITAL: [&str; 6] = [
             "File",

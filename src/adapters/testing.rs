@@ -19,11 +19,14 @@ use std::{
     time::Duration,
 };
 
+use crate::domain::browse::{
+    ArtistProfile, CatalogPage, EntityKind, LabelProfile, ReleaseDetail, SearchPage, WantEntry,
+};
 use crate::domain::collection::Page;
 use crate::domain::identity::{FolderId, PageSize, ReleaseId, Username};
 use crate::domain::market::Sale;
 use crate::error::{Error, Result};
-use crate::ports::{Clock, CollectionSource, SaleSource, Sleeper};
+use crate::ports::{CatalogSource, Clock, CollectionSource, SaleSource, Sleeper, WantlistStore};
 
 /// A [`CollectionSource`] that replays canned pages and records what it was
 /// asked for.
@@ -173,6 +176,232 @@ impl Clock for FixedClock {
 impl Default for FixedClock {
     fn default() -> Self {
         Self(1_700_000_000)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Digger test doubles: a catalog fake that records calls, and a wantlist
+// that lives only in memory.
+// ---------------------------------------------------------------------------
+
+/// One catalog lookup, recorded so tests can assert about *policy* (what was
+/// asked, in what order) rather than about HTTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCall {
+    Artist(u64),
+    Label(u64),
+    Detail(ReleaseId),
+    ArtistReleases(u64, u32),
+    LabelReleases(u64, u32),
+    Search(String),
+}
+
+/// A [`CatalogSource`] serving canned answers and recording every call.
+///
+/// # Deliberately no network
+///
+/// The digger's orchestration bugs are "requested page 2 twice", "re-enqueued
+/// the same detail". This fake makes those observable without a listener.
+#[derive(Debug, Default)]
+pub struct FakeCatalogSource {
+    recorded: std::sync::Mutex<Vec<CatalogCall>>,
+    artists: HashMap<u64, ArtistProfile>,
+    labels: HashMap<u64, LabelProfile>,
+    details: HashMap<ReleaseId, ReleaseDetail>,
+    artist_releases: HashMap<u64, CatalogPage>,
+    label_releases: HashMap<u64, CatalogPage>,
+    search: SearchPage,
+    fault: Option<String>,
+}
+
+impl FakeCatalogSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every lookup fails with this message.
+    pub fn failing(message: impl Into<String>) -> Self {
+        let mut source = Self::new();
+        source.fault = Some(message.into());
+        source
+    }
+
+    pub fn with_artist(mut self, id: u64, profile: ArtistProfile) -> Self {
+        self.artists.insert(id, profile);
+        self
+    }
+
+    pub fn with_label(mut self, id: u64, profile: LabelProfile) -> Self {
+        self.labels.insert(id, profile);
+        self
+    }
+
+    pub fn with_detail(mut self, id: ReleaseId, detail: ReleaseDetail) -> Self {
+        self.details.insert(id, detail);
+        self
+    }
+
+    /// One canned page per listing id (the fake answers every page with it).
+    pub fn with_artist_page(mut self, id: u64, page: CatalogPage) -> Self {
+        self.artist_releases.insert(id, page);
+        self
+    }
+
+    pub fn with_label_page(mut self, id: u64, page: CatalogPage) -> Self {
+        self.label_releases.insert(id, page);
+        self
+    }
+
+    pub fn with_search(mut self, page: SearchPage) -> Self {
+        self.search = page;
+        self
+    }
+
+    /// The calls so far, most recent last.
+    pub fn requests(&self) -> Vec<CatalogCall> {
+        self.recorded
+            .lock()
+            .map(|calls| calls.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl CatalogSource for FakeCatalogSource {
+    fn artist(&self, id: u64) -> Result<ArtistProfile> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::Artist(id)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        self.artists
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::msg(format!("fake catalog: no artist {id} canned")))
+    }
+
+    fn label(&self, id: u64) -> Result<LabelProfile> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::Label(id)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        self.labels
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::msg(format!("fake catalog: no label {id} canned")))
+    }
+
+    fn release_detail(&self, id: ReleaseId) -> Result<ReleaseDetail> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::Detail(id)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        self.details
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::msg(format!("fake catalog: no detail for release {id}")))
+    }
+
+    fn artist_releases(&self, id: u64, page: u32) -> Result<CatalogPage> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::ArtistReleases(id, page)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        self.artist_releases
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::msg(format!("fake catalog: no artist releases for {id}")))
+    }
+
+    fn label_releases(&self, id: u64, page: u32) -> Result<CatalogPage> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::LabelReleases(id, page)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        self.label_releases
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::msg(format!("fake catalog: no label releases for {id}")))
+    }
+
+    fn search(&self, query: &str, _kind: Option<EntityKind>, _page: u32) -> Result<SearchPage> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::Search(query.to_string())))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        Ok(self.search.clone())
+    }
+}
+
+/// An in-memory [`WantlistStore`], for update-loop tests that must not touch
+/// a filesystem.
+#[derive(Debug, Default)]
+pub struct MemoryWantlist {
+    entries: std::sync::Mutex<Vec<WantEntry>>,
+}
+
+impl MemoryWantlist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl WantlistStore for MemoryWantlist {
+    fn add(&self, entry: &WantEntry) -> Result<bool> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| Error::msg("wantlist poisoned"))?;
+        if entries
+            .iter()
+            .any(|want| want.kind == entry.kind && want.id == entry.id)
+        {
+            return Ok(false);
+        }
+        entries.push(entry.clone());
+        entries.sort_by(|a, b| b.added_at.cmp(&a.added_at).then(a.name.cmp(&b.name)));
+        Ok(true)
+    }
+
+    fn remove(&self, kind: EntityKind, id: u64) -> Result<bool> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| Error::msg("wantlist poisoned"))?;
+        let before = entries.len();
+        entries.retain(|want| !(want.kind == kind && want.id == id));
+        Ok(entries.len() != before)
+    }
+
+    fn list(&self) -> Result<Vec<WantEntry>> {
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| Error::msg("wantlist poisoned"))?
+            .clone())
+    }
+
+    fn contains(&self, kind: EntityKind, id: u64) -> Result<bool> {
+        Ok(self
+            .list()?
+            .iter()
+            .any(|want| want.kind == kind && want.id == id))
     }
 }
 

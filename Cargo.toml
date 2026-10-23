@@ -2,6 +2,10 @@
 name = "diggers-rarity"
 version = "0.1.0"
 edition = "2024"
+## Two binaries in one crate. The digger TUI is the conversation, so bare
+## `cargo run` starts it; the collection report answers to
+## `cargo run --bin diggers-rarity`.
+default-run = "digger"
 
 [dependencies]
 anyhow = "1.0"
@@ -9,3 +13,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+## TUI: ratatui draws, crossterm owns the terminal. Pinned as one pair — they
+## move together. `digger` (src/bin/digger.rs) is the digger TUI binary.
+ratatui = "0.29"
+crossterm = "0.28"
+## Reads `.env` from the working directory in both binaries, so a token can
+## sit in one gitignored file instead of a shell profile.
+dotenvy = "0.15"

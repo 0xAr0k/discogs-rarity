@@ -24,7 +24,6 @@ use crate::{
         collection::{Collection, PageSet},
         identity::{FolderId, PageSize, ReleaseId, Username},
         market::{self, MarketSnapshot, Sale},
-        rarity::{self, RaritySignals},
         release::{OwnedRelease, Release},
         valuation::{CollectionValuation, Condition, Valuation},
     },
@@ -169,65 +168,24 @@ pub fn gather_sales(
     by_release
 }
 
-/// Step 3: derive rarity signals for one pressing.
+/// Value one pressing.
 ///
-/// # TODO(you) — exercise 1c
-///
-/// Right now this only wires up [`rarity::edition_signal`], which is local
-/// metadata. The interesting part needs the network: Discogs reports
-/// `community.have` (how many people own it) and `community.want` on the
-/// release endpoint. The honest plan:
-///
-/// 1. Add a `CommunityStats` domain type in `rarity` with `have: u64`,
-///    `want: u64`.
-/// 2. Add it to a port — extend [`CollectionSource`], or better, add a
-///    `ReleaseDetailSource` so sale fetching and stats fetching stay separate.
-/// 3. Fetch it in `run`, convert to a normalized `0..=1` magnitude.
-///    Normalization needs a *reference point*: `scarcity = 1 - have/have_max`
-///    where `have_max` is... what? Options: a fixed constant (simple, dated), a
-///    percentile across *your own collection* (adaptive, but means the same
-///    record scores differently for different users), or a log scale (robust
-///    to the extreme skew in `have` counts — most records have a few hundred,
-///    a few have thousands).
-/// 4. Decide how a *failing* stats fetch affects the output. Same question as
-///    step 2: partial is fine.
-pub fn signals_for(release: &Release) -> RaritySignals {
-    let edition = rarity::edition_signal(release);
-    RaritySignals {
-        edition: edition.map(|signal| signal.magnitude),
-        scarcity: None,
-        demand: None,
-        discontinued: None,
-        active_pressing: None,
-    }
-}
-
-/// Step 4: value one pressing.
-///
-/// # TODO(you) — exercise 3c
-///
-/// Wire the pieces together once they exist:
-///
-/// ```ignore
-/// let snapshot = &snapshots[i];
-/// let market = market::estimate_from_sales(&snapshot.sales, window_days);
-/// let value = valuation::apply_condition(market, condition)
-///     .map(|money| PriceRange::exact(money));
-/// let rarity = rarity::classify(&signals_for(&release));
-/// ```
-///
-/// Then the interesting design question: **how does confidence combine?**
-/// `value` should not be present when confidence is ~0. And what is `copies`
-/// doing here — a per-pressing value or a per-collection total? Keep it
-/// per-pressing and let [`CollectionValuation::total`] do the arithmetic.
+/// The pricing story (a market estimator, a condition model, and the
+/// confidence that mixes them — "how does a thin sample change the number
+/// you print?") is deliberately not written: a rule that confidently
+/// mis-prices a pressing is worse than an honest "unknown". Until a decision
+/// lands and an estimator exists, every valuation is [`Valuation::unknown`],
+/// which the renderer reports as `value unknown` rather than `€0.00`. The
+/// arguments are kept so the eventual wiring is local, and the raw copies
+/// count is part of that eventual wiring: multiplicity discounts lots, which
+/// is its own decision.
 pub fn value_release(
     release: &Release,
     copies: u32,
     condition: Condition,
     snapshot: Option<&MarketSnapshot>,
 ) -> Valuation {
-    let _ = (release, copies, condition, snapshot);
-    // TODO(you): exercise 3c — build a real Valuation.
+    let _ = (copies, condition, snapshot);
     Valuation::unknown(release.id, copies, condition)
 }
 
@@ -239,7 +197,6 @@ pub fn value_collection(
     snapshots: Vec<MarketSnapshot>,
     now: i64,
 ) -> Report {
-    // TODO(you): exercise 3b — wire up `CollectionValuation::total`.
     let valuations = owned
         .iter()
         .map(|item| value_release(&item.release, item.copies, Condition::Mint, None))
@@ -493,15 +450,6 @@ mod tests {
             std::time::Duration::from_secs(30),
         );
         assert!(sleeper.total().is_zero(), "no leading sleep, please");
-    }
-
-    // ---- Step 3: signals -----------------------------------------------
-
-    #[test]
-    fn signals_are_only_filled_in_from_local_metadata_today() {
-        let signals = signals_for(&release(101, "A"));
-        assert_eq!(signals.scarcity, None);
-        assert_eq!(signals.demand, None);
     }
 
     // ---- Step 5 and run ------------------------------------------------

@@ -223,7 +223,8 @@ fn sale_lookups_are_paced_between_requests_but_not_before_the_first() {
     }
 
     // Calls `gather_sales` directly rather than the whole pipeline, so this
-    // policy assertion keeps passing while exercise 2d is still a `todo!`.
+    // policy assertion about gap placement holds even as the pricing story
+    // evolves.
     let owned = app::load_collection(
         &source_for(vec![
             release(101, "A"),

@@ -1,1 +1,3 @@
 /target
+# Tokens and other secrets: DISCOGS_TOKEN etc. Never committed.
+.env

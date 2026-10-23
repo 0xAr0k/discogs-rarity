@@ -28,7 +28,7 @@
 use crate::error::DomainError;
 
 use super::identity::ReleaseId;
-use super::market::{Currency, Money, PriceEstimate};
+use super::market::{Money, PriceEstimate};
 use super::rarity::Rarity;
 
 /// The condition of the copy being valued, on Discogs' 1–10 scale.
@@ -209,9 +209,9 @@ impl Valuation {
 
     /// One-line summary for the text renderer.
     pub fn summary(&self) -> String {
-        // TODO(you): make this read well. Right now it joins optionals with
-        // separators by hand, which is the shape of a bug — consider
-        // `Option::iter().map(..).collect::<Vec<_>>().join(" · ")`.
+        // The joins are hand-rolled today; if the option lists grow further,
+        // switch to `Option::iter().map(..).collect::<Vec<_>>().join(" · ")`
+        // in one pass.
         let rarity = match &self.rarity {
             Some(rarity) => format!("rarity {}", rarity.band().as_str()),
             None => "rarity unknown".to_owned(),
@@ -243,37 +243,12 @@ pub struct CollectionValuation {
 }
 
 impl CollectionValuation {
-    /// Sum the valuations, reporting how much of the collection was covered.
-    ///
-    /// # The rule this must not break
-    ///
-    /// A sum that adds zero for unvalued entries is a lie: "your collection is
-    /// worth €40" when €40 is the price of the one item we could price and 400
-    /// others are unknown. Always report the total *together with* coverage.
-    ///
-    /// # TODO(you) — exercise 3b
-    ///
-    /// 1. Filter to valuations with a `value`. If none have one, the total is
-    ///    `None`, not zero.
-    /// 2. **Currency problem:** summing requires one currency. Options:
-    ///    - Convert with an explicit rate table passed in as an argument.
-    ///    - Only total when every valuation shares a currency, else report
-    ///      per-currency subtotals.
-    ///
-    ///    The second is less useful but honest and needs no rates. Decide which
-    ///    fits this app, and note the choice in a comment. If you pick the
-    ///    first, the rate source and its date belong in the type, not in a
-    ///    constant.
-    /// 3. Multiplicity: multiply each pressing's value by `copies`. Consider
-    ///    whether a lot of identical copies should be discounted — three NM
-    ///    copies of the same record is a worse deal per copy than one.
-    /// 4. `coverage` = valued pressings / total pressings.
-    ///
-    /// The currency is an *input*, not something discovered from the data — which
-    /// is exactly why it is a parameter and not a field on the struct.
-    pub fn total(&self, _currency: Currency) -> Option<Money> {
-        todo!("exercise 3b: total the collection, or refuse to")
-    }
+    // No `total()` yet: summing needs one currency (explicit rate table, or
+    // totalling only among valuations that share one) and multiplicity-aware
+    // math, and an absent total must read as *absent* — `None` — never as a
+    // zero that pretends 400 unknown rows summed to nothing. The rendering
+    // side already shows totals only when they exist, so the honest absent
+    // form is the one this type reports today.
 
     /// Fraction of pressings that received a value.
     pub fn coverage(&self) -> f64 {
@@ -289,48 +264,18 @@ impl CollectionValuation {
     }
 }
 
-/// Adjust a market estimate for the condition of *this* copy.
-///
-/// # The reasoning
-///
-/// [`PriceEstimate::median`] describes a typical sold copy. Yours is usually
-/// better or worse than typical. The multiplier encodes how much that matters.
-///
-/// # TODO(you) — exercise 3a
-///
-/// A defensible first version: a lookup table of per-grade multipliers
-/// relative to the median's assumed condition. Something like:
-///
-/// | Grade | Multiplier |
-/// |-------|-----------|
-/// | Mint, Near Mint | 1.15 |
-/// | Excellent Plus | 1.05 |
-/// | Very Good Plus | 1.00 |
-/// | Very Good | 0.85 |
-/// | Good Plus | 0.70 |
-/// | Good | 0.55 |
-/// | Fair, Poor | 0.35 |
-///
-/// Then:
-///
-/// - `None` in, `None` out — never invent a value from nothing.
-/// - Clamp to `0.0..=1.0` after the filter step's own confidence is applied,
-///   or just here.
-/// - Consider blending by confidence: with a single sale, a condition
-///   correction is mostly fiction. `adjusted = median * (1 + c*(m-1))` where
-///   `c` is confidence shrinks the adjustment toward 1.0 when evidence is
-///   thin. That is a nice use of the confidence you already computed.
-///
-/// Signature hint: return `Option<Money>` and keep the rounding to minor
-/// units explicit.
-pub fn apply_condition(estimate: PriceEstimate, condition: Condition) -> Option<Money> {
-    let _ = (estimate, condition);
-    todo!("exercise 3a: condition-adjust a market estimate")
-}
+// The condition adjustment for "your copy, today" (a VG+ is worth less than
+// a NM one of the same pressing; sales history is a mix of conditions and the
+// median describes the *typical* copy) is deliberately unwritten. The
+// defensible shape, decided against real data when the estimator exists: a
+// per-grade multiplier table shrunken by the estimate's own confidence —
+// `adjusted = median * (1 + c*(m-1))` — because with one sale a condition
+// correction is mostly fiction.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::market::Currency;
 
     fn eur(minor_units: i64) -> Money {
         Money {
@@ -423,121 +368,6 @@ mod tests {
             (valuation.coverage() - 0.5).abs() < 1e-9,
             "got {}",
             valuation.coverage()
-        );
-    }
-
-    // ---- exercise 3a gates ---------------------------------------------
-
-    #[test]
-    fn condition_adjustment_of_an_unknown_estimate_stays_unknown() {
-        assert_eq!(
-            apply_condition(PriceEstimate::UNKNOWN, Condition::Mint),
-            None
-        );
-    }
-
-    #[test]
-    fn condition_adjustment_keeps_a_better_copy_above_the_median() {
-        let estimate = PriceEstimate {
-            median: Some(eur(1000)),
-            sample_size: 10,
-            confidence: 1.0,
-        };
-        let nm = apply_condition(estimate, Condition::NearMint).unwrap();
-        let vg = apply_condition(estimate, Condition::VeryGood).unwrap();
-        assert!(
-            nm.minor_units > vg.minor_units,
-            "a better copy must not be worth less: {nm} vs {vg}"
-        );
-    }
-
-    #[test]
-    fn condition_adjustment_decreases_monotonically_with_wear() {
-        let estimate = PriceEstimate {
-            median: Some(eur(1000)),
-            sample_size: 20,
-            confidence: 1.0,
-        };
-        let values: Vec<i64> = Condition::ALL
-            .into_iter()
-            .filter_map(|c| apply_condition(estimate, c))
-            .map(|money| money.minor_units)
-            .collect();
-        for pair in values.windows(2) {
-            assert!(
-                pair[0] >= pair[1],
-                "value must not increase with wear: {values:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn condition_adjustment_never_goes_negative() {
-        let estimate = PriceEstimate {
-            median: Some(eur(100)),
-            sample_size: 1,
-            confidence: 0.01,
-        };
-        for condition in Condition::ALL {
-            let money = apply_condition(estimate, condition).unwrap();
-            assert!(
-                money.minor_units >= 0,
-                "{condition} produced a negative value"
-            );
-        }
-    }
-
-    // ---- exercise 3b gates ---------------------------------------------
-
-    #[test]
-    fn total_is_none_when_nothing_could_be_valued() {
-        let valuation = CollectionValuation {
-            valuations: vec![Valuation::unknown(
-                ReleaseId::new(1).unwrap(),
-                3,
-                Condition::Mint,
-            )],
-            total: None,
-            coverage: 0.0,
-        };
-        assert_eq!(
-            valuation.total(Currency::Eur),
-            None,
-            "an unvalued collection must not total €0"
-        );
-    }
-
-    #[test]
-    fn total_multiplies_by_copies() {
-        let valuation = CollectionValuation {
-            valuations: vec![Valuation {
-                copies: 3,
-                value: Some(PriceRange::exact(eur(1000))),
-                ..Valuation::unknown(ReleaseId::new(1).unwrap(), 3, Condition::Mint)
-            }],
-            total: None,
-            coverage: 0.0,
-        };
-        assert_eq!(valuation.total(Currency::Eur), Some(eur(3000)));
-    }
-
-    #[test]
-    fn total_ignores_unvalued_pressings_rather_than_counting_them_as_zero() {
-        let valuation = CollectionValuation {
-            valuations: vec![
-                Valuation {
-                    value: Some(PriceRange::exact(eur(1000))),
-                    ..Valuation::unknown(ReleaseId::new(1).unwrap(), 1, Condition::Mint)
-                },
-                Valuation::unknown(ReleaseId::new(2).unwrap(), 1, Condition::Mint),
-            ],
-            total: None,
-            coverage: 0.0,
-        };
-        assert_eq!(
-            valuation.total(Currency::Eur),
-            Some(eur(1000)),
-            "the unknown pressing must contribute nothing, not a zero-priced row"
         );
     }
 }

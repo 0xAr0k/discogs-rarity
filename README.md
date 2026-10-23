@@ -1,41 +1,54 @@
 # diggers-rarity
 
 A Rust CLI that reads a Discogs collection and reports, for each pressing you
-own, **how rare it looks** and **what it is worth right now**.
+own, **how rare it looks** and **what it is worth right now** — plus the
+`digger` TUI for digging through the catalog interactively.
 
-The interesting parts are unfinished on purpose — see
-[Exercises](#exercises). Fetching, deduplication, and data validation are done
-and tested.
+Fetching, deduplication, and data validation are done and tested. Rarity
+scoring and price estimation are deliberately *not* invented: a rule that
+confidently mis-prices a pressing is worse than an honest "unknown", and the
+honest unknown is what the report prints today.
 
 ## Status
 
-| Working | Left for you |
+| Working | Not invented yet |
 |---|---|
-| paging, rate limiting, token handling | rarity scoring (`classify`) |
+| paging, rate limiting, token handling | rarity scoring |
 | collection coherence validation | edition signal detection |
 | deduplication by pressing, with copy counts | median and price estimation |
 | date/ISO-8601 parsing, currency conversion | condition adjustment |
 | text and JSON output | collection totals |
 | `Sleeper`/`Clock` ports + fakes | HTTP-level adapter tests |
 
-29 tests fail with `not yet implemented`. Each one is a documented exercise.
+Every absent number renders as an absence (`unknown`, `—`), never as a zero.
 
 ## Usage
+
+Two binaries now ship from this one crate:
+
+- **`diggers-rarity`** — the collection report CLI
+- **`digger`** — the Discogs-digging TUI (see `docs/UX.md`)
 
 Requires a current stable Rust toolchain with edition 2024.
 
 ```sh
 # Public collection, all folders, text summary
-cargo run --locked -- your_username
+cargo run --locked --bin diggers-rarity -- your_username
 
 # JSON, for piping elsewhere
-cargo run --locked -- your_username --format json
+cargo run --locked --bin diggers-rarity -- your_username --format json
 
 # One folder, tighter pricing window
-cargo run --locked -- your_username --folder 1 --market-window-days 90
+cargo run --locked --bin diggers-rarity -- your_username --folder 1 --market-window-days 90
 
-cargo run --locked -- --help
+cargo run --locked --bin diggers-rarity -- --help
+
+# The digger TUI
+cargo run --locked --bin digger
 ```
+
+With only one binary the `--bin` suffix is optional; with two, cargo refuses
+to guess, so the examples always name one.
 
 Set `DISCOGS_TOKEN` for private collections or higher rate limits. The env var
 is preferred over `--token`: shell history and `ps` output are readable by
@@ -85,6 +98,26 @@ collection as worth the price of the one item it managed to price, so
 - **Tokens are marked sensitive**, so they do not appear in debug output or
   error dumps. `describe_token_source` never echoes the value.
 
+## The digger (second binary)
+
+`cargo run --locked --bin digger` opens a terminal UI for browsing the Discogs
+database — artists by id or search, labels, releases — with a persistent
+wantlist on `w`. Everything above about architecture holds; the TUI is just a
+second `app` in front of the same ports:
+
+```text
+  tui::update  ──▶  ports  ◀──  adapters
+       │  pure                    DiscogsCatalogSource · JsonWantlist
+       └─▶ tui::runtime (one worker thread owns the ports, strictly
+            sequential: the sequence is the rate limiter)
+```
+
+- `docs/UX.md` — screens, keys, what each column claims
+- `docs/DECISIONS.md` — D-01…D-11 decided, Q-01…Q-06 open
+- `docs/DISCOGS.md` — the catalog endpoints and their quirks
+
+No collection required; anonymous browsing works, search wants `DISCOGS_TOKEN`.
+
 ## Architecture
 
 ```text
@@ -101,23 +134,6 @@ The property is enforced by a test: `tests/integration.rs` implements
 private type breaks the build.
 
 Full explanation, including what each seam costs: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
-
-## Exercises
-
-[docs/EXERCISES.md](docs/EXERCISES.md) — seven exercises in dependency order,
-each with the questions worth sitting on and the traps that feel productive
-until they are not. Every one is gated by a test that already exists.
-
-```sh
-cargo test --lib domain::rarity     # 1: rarity signals and scoring
-cargo test --lib domain::market     # 2: outliers, confidence, median
-cargo test --lib domain::valuation  # 3: condition adjustment, totals
-```
-
-The judgement calls are deliberately left open: whether signed sales are
-discarded or valued separately, how to normalize a wildly skewed `have` count,
-what "confidence" means, and how to handle summing across currencies. Each has
-more than one defensible answer, and the notes say which is which.
 
 ## Learning notes
 
@@ -138,7 +154,8 @@ cargo test --locked
 
 Tests need no Discogs account, token, or network: adapters are tested through
 `adapters::testing` fakes. The one gap is HTTP-level adapter testing, which
-`RecordingSleeper` was built to make feasible — see Exercise 5.
+`RecordingSleeper` was built to make feasible.
 
-`cargo test` currently exits nonzero while the exercises are unimplemented.
-That is intentional.
+`cargo test` should exit zero. The scoring and pricing stories are absent code,
+not failing tests — a `todo!()` on a production path (as the old estimator
+scaffolding had) is a panic waiting for real data, so it is gone.

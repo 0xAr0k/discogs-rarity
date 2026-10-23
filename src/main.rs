@@ -51,6 +51,11 @@ fn main() -> ExitCode {
 /// `run() -> Result<()>` is testable, composable, and is what every other
 /// module's tests would have called otherwise.
 fn run() -> Result<()> {
+    // `.env` first, so clap's `env = "DISCOGS_TOKEN"` sees a file-based token
+    // the same way it sees an exported one. A missing file is normal; a bad
+    // one leaves the token unset and `Args::parse` reports any consequences.
+    let _ = dotenvy::dotenv();
+
     let args = Args::parse();
     let format = args.output_format();
 
@@ -58,11 +63,6 @@ fn run() -> Result<()> {
     let request = args.into_request()?;
 
     // 2. Fetch and analyse.
-    //
-    //    TODO(you): exercise 7 — pass the token explicitly instead of letting
-    //    `run_discogs` read the environment. Today the env var is invisible to
-    //    tests, which means the anonymous/authenticated pacing split is
-    //    untestable.
     let report = app::run_discogs(request)?;
 
     // 3. Render. Serialization failures become a `Result` rather than a panic.
@@ -82,16 +82,11 @@ fn run() -> Result<()> {
 
 /// Serialize a report in the requested format.
 ///
-/// # TODO(you) — exercise 6
-///
-/// Move this into [`Format`] and change its signature to
-/// `fn render(&self, report: &Report) -> Result<String>`. Then `ui::json::render`
-/// no longer needs `unwrap_or_else` to fake an error document, and a renderer
-/// that fails produces a real error message instead of JSON-shaped noise.
-///
-/// Note the trade-off: buffering the whole report in a `String` costs memory for
-/// very large collections. `ui::json::write_to` already exists for streaming;
-/// consider using it here for the JSON path once this is done.
+/// A future refactor worth its own decision: move this into [`Format`] with
+/// the signature `fn render(&self, report: &Report) -> Result<String>`, so a
+/// failing renderer produces a real error message instead of JSON-shaped
+/// noise, and use `ui::json::write_to` for the streaming path — buffering the
+/// whole report in a `String` costs memory for very large collections.
 fn render(format: &Format, report: &app::Report) -> Result<String> {
     Ok(format.render(report))
 }

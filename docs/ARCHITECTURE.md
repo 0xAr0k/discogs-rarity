@@ -109,8 +109,9 @@ more.
 Pure rules are tested where they live; wiring and output contracts are tested
 from outside. See `tests/README.md` for why the JSON fixture is gone.
 
-29 tests currently fail with `not yet implemented`. That is the exercise list —
-`docs/EXERCISES.md` maps them one-to-one.
+Every test passes. Where scoring/pricing work is still missing, the code is
+missing with it — an absent `classify` beats a `todo!()` that panics on live
+data (`docs/DECISIONS.md`, D-20).
 
 ## Where to add things
 
@@ -123,3 +124,31 @@ from outside. See `tests/README.md` for why the JSON fixture is gone.
 | cache collection data | a `CollectionSource` that wraps another one |
 | add a currency | `market::Currency` — its exponent and code live there together |
 | add a field to the output | `ui::json` view types, not the domain structs |
+
+## The digger's shape
+
+The TUI (`cargo run --bin digger`, `docs/UX.md`) is a second consumer of the
+same ports, built as a functional core/impure shell:
+
+```text
+  keys, replies (Msg)
+        │
+        ▼
+  update(model, msg) → Vec<Effect>     pure. tests drive keys, assert state.
+        │
+        ▼
+  runtime (worker owns ports; strict order; the sequence IS the limiter)
+```
+
+- `tui::model` — state, `Msg`, `Effect`. No I/O types in signatures.
+- `tui::update` — the whole behavior of the app, testable with zero terminals.
+- `tui::view` — rendering only; its arithmetic (date, truncation) is pure
+  and tested locally.
+- `tui::runtime` — the only place with threads; no decisions in it.
+
+`domain::browse` extends the domain with the dig-side vocabulary
+(`CatalogRow`, `ReleaseDetail`, `SearchPage`, `want_pressure`,
+`is_vinyl_format`); the disk-backed wantlist is the first stateful port
+(`WantlistStore`), exercised through `JsonWantlist` in production and
+`MemoryWantlist` in tests. The digger's decisions and open questions live in
+`docs/DECISIONS.md`.

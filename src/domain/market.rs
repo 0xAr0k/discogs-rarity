@@ -94,7 +94,7 @@ impl std::fmt::Display for Money {
 ///
 /// This is *evidence*, not truth. [`Sale::is_outlier`] exists to separate the
 /// two.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sale {
     /// Amount paid, in minor units of `currency`.
     pub price: Money,
@@ -115,6 +115,12 @@ pub struct Sale {
     /// Whether the listing was for a media copy or an apparent "look at
     /// photo only" sale, which is unreliable data.
     pub is_media_only: bool,
+    /// Who sold it, when the wire names one.
+    ///
+    /// `None` is *unknown*, not "sold by nobody" — the sale happened, the
+    /// name just did not come back. The digger's release sheet prints `…`
+    /// for it; the estimate math ignores it entirely.
+    pub seller: Option<String>,
 }
 
 impl Sale {
@@ -286,6 +292,7 @@ mod tests {
             condition,
             is_signed: false,
             is_media_only: false,
+            seller: None,
         }
     }
 

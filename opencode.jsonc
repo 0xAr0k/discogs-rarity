@@ -1,0 +1,24 @@
+{
+  // Project configuration. Skills are discovered from .opencode/skills/
+  // automatically; agents from .opencode/agents/. Only the pieces that need
+  // an explicit knob live here.
+  "$schema": "https://opencode.ai/config.json",
+
+  // AGENTS.md is discovered on its own; this makes the docs table explicit
+  // so agents re-read the docs that were authored to teach them.
+  "instructions": [
+    "AGENTS.md",
+    "docs/UX.md",
+    "docs/DECISIONS.md",
+    "docs/DISCOGS.md",
+  ],
+
+  // This repo's rule: history is never rewritten or pushed — the working
+  // tree is the deliverable. Make both require an explicit yes.
+  "permissions": [
+    { "action": "shell", "resource": "git push*", "effect": "ask" },
+    { "action": "shell", "resource": "git push --force*", "effect": "ask" },
+    { "action": "shell", "resource": "git reset --hard*", "effect": "ask" },
+    { "action": "shell", "resource": "git clean*", "effect": "ask" },
+  ],
+}

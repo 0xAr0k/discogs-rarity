@@ -194,6 +194,7 @@ pub enum CatalogCall {
     ArtistReleases(u64, u32),
     LabelReleases(u64, u32),
     Search(String),
+    Sales(ReleaseId),
 }
 
 /// A [`CatalogSource`] serving canned answers and recording every call.
@@ -211,6 +212,7 @@ pub struct FakeCatalogSource {
     artist_releases: HashMap<u64, CatalogPage>,
     label_releases: HashMap<u64, CatalogPage>,
     search: SearchPage,
+    sales: HashMap<ReleaseId, Vec<Sale>>,
     fault: Option<String>,
 }
 
@@ -254,6 +256,12 @@ impl FakeCatalogSource {
 
     pub fn with_search(mut self, page: SearchPage) -> Self {
         self.search = page;
+        self
+    }
+
+    /// Canned sale rows for one release; every lookup answers with them.
+    pub fn with_sales(mut self, id: ReleaseId, sales: Vec<Sale>) -> Self {
+        self.sales.insert(id, sales);
         self
     }
 
@@ -346,6 +354,17 @@ impl CatalogSource for FakeCatalogSource {
             return Err(Error::msg(fault.clone()));
         }
         Ok(self.search.clone())
+    }
+
+    fn release_sales(&self, id: ReleaseId) -> Result<Vec<Sale>> {
+        self.recorded
+            .lock()
+            .map(|mut c| c.push(CatalogCall::Sales(id)))
+            .ok();
+        if let Some(fault) = &self.fault {
+            return Err(Error::msg(fault.clone()));
+        }
+        Ok(self.sales.get(&id).cloned().unwrap_or_default())
     }
 }
 

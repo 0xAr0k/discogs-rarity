@@ -218,6 +218,7 @@ fn sale_lookups_are_paced_between_requests_but_not_before_the_first() {
                 condition: 2,
                 is_signed: false,
                 is_media_only: false,
+                seller: None,
             }],
         );
     }

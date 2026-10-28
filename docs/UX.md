@@ -28,7 +28,7 @@ Stack, home at the floor:
 | **Home** | one prompt, two help columns | the entry point |
 | **Search** | hits for a name query, as a bordered table (`title year format label cat# rare`) | `home → type a name → ⏎` |
 | **Entity** | artist or label profile + a release table | `home → an id`, or `⏎` on a search hit — masters open via their main release |
-| **Release** | full detail of one pressing | `⏎` on a table row or a release hit |
+| **Release** | full detail of one pressing, with its sale rows (`condition price shop`) | `⏎` on a table row or a release hit |
 | **Wantlist** | everything you promised to dig | `F2` from anywhere |
 
 ## Keys
@@ -134,6 +134,18 @@ fetched first (the block title carries the order, e.g. `releases · rare ·
 - a fresh page also sorts on arrival (`←`/`→` keeps the order), and the
   selection stays pinned to the row it was on.
 
+## The release sheet, and its sales
+
+Opening a release fetches its sale rows alongside the sheet (one request,
+session-cached in the adapter, so a reopen is free). They replace the
+wire's video titles as the tail of the sheet: a bold `sales · N` header,
+then one row per sale — condition (Discogs' label), price (ASCII glyph,
+the same shape the `ask` line uses), shop. Unknown is not zero: a seller
+the wire did not name prints `…`, an unreadable row is dropped (never a
+zero-price line), an empty history says `none on record`, and a failed
+fetch says `could not fetch` with the reason on the status line — the
+section never spins forever.
+
 ## The look — Kanagawa, and a transparent ground
 
 The palette is [Kanagawa](https://github.com/rebelot/kanagawa):
@@ -150,7 +162,9 @@ terminal's choice; the sheet keeps its legibility by spacing and weight.
 
 Listing endpoints and search carry no community counts. The moment rows
 or hits land, the digger fetches details for the ones on screen a few at
-a time, capped at four in flight, filling each row in place — on the
+Listing endpoints and search carry no community counts. The moment rows
+or hits land, the digger fetches details for the ones on screen a few at
+a time, capped at eight in flight, filling each row in place — on the
 entity screen and the search screen alike. Masters are never enriched —
 they have no release detail at all (`docs/DECISIONS.md`, Q-01).
 

@@ -280,3 +280,19 @@ totals) carry honest unknowns downstream. Judgement calls the exercises
 held open (signed sales, confidence, currency totals, edition scoring)
 remain open as plain comments beside the code that will need the answers.
 `docs/EXERCISES.md` records the inventory.
+
+## D-21 — The release sheet sells its rows, not its videos (2026-10-23)
+
+The operator: "instead of videos we show all the sales like a list with
+condition, price, shop name as the rows". The sheet's `videos` section is
+gone — domain field, wire type, and all — and the sale rows come in on
+`Msg::SalesLoaded` when the sheet opens (`Effect::LoadSales`, one request
+per open; the adapter keeps a session cache of `Vec<Sale>` beside its
+detail cache, and as there, session-scoped: stale sale data would lie).
+
+Shape notes: the `seller` name is parsed as a bare string or
+`{ "username": … }` — either is a shop, neither is `…` (unknown, not
+shopless). A fetch failure settles the section to `Failed` instead of
+spinning forever, matched by the failure's context label
+("release sales {id}") so a dead sheet's failure can never settle the
+live one — the precision D-19 taught, applied one layer down.

@@ -398,6 +398,7 @@ mod tests {
                 condition: 2,
                 is_signed: false,
                 is_media_only: false,
+                seller: None,
             }],
         );
 

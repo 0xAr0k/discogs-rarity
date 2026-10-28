@@ -225,8 +225,6 @@ pub struct ReleaseDetail {
     /// `docs/DISCOGS.md` § value explains the honest gap.
     pub lowest_price: Option<Money>,
     pub num_for_sale: Option<u32>,
-    /// Video titles, display only.
-    pub videos: Vec<String>,
 }
 
 impl ReleaseDetail {

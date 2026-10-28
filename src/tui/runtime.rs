@@ -254,6 +254,16 @@ fn execute(
                 }
             }
         },
+        E::LoadSales(release) => match api.release_sales(release) {
+            Ok(sales) => vec![Msg::SalesLoaded { release, sales }],
+            // Terminal: closes the sheet's counted job, and `update`'s
+            // `failed` settles the section by its context label.
+            Err(error) => vec![failed(
+                true,
+                format!("release sales {}", release.get()),
+                error.to_string(),
+            )],
+        },
         E::Enrich(release_id) => match api.release_detail(release_id) {
             Ok(detail) => vec![Msg::DetailLoaded(
                 OpenRequest::Enrich(release_id),

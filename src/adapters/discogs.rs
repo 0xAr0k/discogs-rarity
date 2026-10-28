@@ -412,15 +412,23 @@ impl SaleSource for DiscogsCollectionSource {
             .http
             .url_for(&["releases", &release_id.get().to_string()])?;
         let value = self.http.get_json(&url, "release sales")?;
-        let raw: RawSalesResponse = serde_json::from_value(value)
-            .map_err(|error| Error::msg(format!("release sales: {error}")))?;
-
-        Ok(raw
-            .history
-            .into_iter()
-            .filter_map(|entry| entry.try_into_sale().ok())
-            .collect())
+        sales_from_wire(value, release_id)
     }
+}
+
+/// Reduce a release's sale-history payload to domain sales.
+///
+/// One conversion for both sources (the collection report reads it too), so
+/// the shape is learned in exactly one place. Unreadable rows are dropped:
+/// one bad datum must not blank a page of evidence.
+fn sales_from_wire(value: serde_json::Value, release_id: ReleaseId) -> Result<Vec<Sale>> {
+    let raw: RawSalesResponse = serde_json::from_value(value)
+        .map_err(|error| Error::msg(format!("release sales {}: {error}", release_id.get())))?;
+    Ok(raw
+        .history
+        .into_iter()
+        .filter_map(|entry| entry.try_into_sale().ok())
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +451,9 @@ impl SaleSource for DiscogsCollectionSource {
 pub struct DiscogsCatalogSource {
     http: DiscogsHttp,
     cache: Mutex<HashMap<ReleaseId, std::sync::Arc<ReleaseDetail>>>,
+    /// The same session cache for sale rows: reopening a release sheet is
+    /// free, and a session-old price is as good as the detail it sits beside.
+    sales_cache: Mutex<HashMap<ReleaseId, std::sync::Arc<Vec<Sale>>>>,
 }
 
 impl DiscogsCatalogSource {
@@ -452,6 +463,7 @@ impl DiscogsCatalogSource {
         Ok(Self {
             http: DiscogsHttp::from_token(token)?,
             cache: Mutex::new(HashMap::new()),
+            sales_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -585,6 +597,26 @@ impl CatalogSource for DiscogsCatalogSource {
         let raw: RawSearchResponse = serde_json::from_value(value)
             .map_err(|error| Error::msg(format!("search: {error}")))?;
         into_search_page(raw.pagination, raw.results)
+    }
+
+    fn release_sales(&self, id: ReleaseId) -> Result<Vec<Sale>> {
+        if let Some(cached) = self
+            .sales_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&id).cloned())
+        {
+            // One clone per cache hit, at the port boundary — same deal as
+            // `cached_detail`.
+            return Ok((*cached).clone());
+        }
+        let url = self.http.url_for(&["releases", &id.get().to_string()])?;
+        let value = self.paced_get_json(url, "release sales")?;
+        let sales = sales_from_wire(value, id)?;
+        if let Ok(mut cache) = self.sales_cache.lock() {
+            cache.insert(id, std::sync::Arc::new(sales.clone()));
+        }
+        Ok(sales)
     }
 }
 
@@ -782,6 +814,32 @@ struct RawSale {
     condition: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// Who sold it. The wire has shown this both as a bare username string
+    /// and as an object with `username` inside; accept either, show `…` for
+    /// neither. `Option` for anything the wire may omit — the sale happened
+    /// regardless of whether we get a name.
+    #[serde(default)]
+    seller: Option<WireSeller>,
+}
+
+/// A wire seller, either shape.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum WireSeller {
+    Bare(String),
+    Named {
+        #[serde(default)]
+        username: String,
+    },
+}
+
+impl WireSeller {
+    fn into_shop(self) -> Option<String> {
+        match self {
+            Self::Bare(name) => Some(name).filter(|name| !name.is_empty()),
+            Self::Named { username } => Some(username).filter(|name| !name.is_empty()),
+        }
+    }
 }
 
 impl RawSale {
@@ -789,7 +847,7 @@ impl RawSale {
     ///
     /// `filter_map` over this at the call site: a sale we cannot read is a
     /// datum we drop, *not* a reason to fail the whole valuation.
-    fn try_into_sale(&self) -> std::result::Result<Sale, WireError> {
+    fn try_into_sale(self) -> std::result::Result<Sale, WireError> {
         let price = self.price.ok_or(WireError::UnparseablePrice)?;
         let currency = match self.currency.as_deref() {
             Some("USD") => Currency::Usd,
@@ -821,6 +879,7 @@ impl RawSale {
                 .title
                 .as_deref()
                 .is_some_and(|title| title.to_lowercase().contains("media only")),
+            seller: self.seller.and_then(|shop| shop.into_shop()),
         })
     }
 }
@@ -1198,12 +1257,6 @@ struct RawIdentifier {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RawVideo {
-    #[serde(default)]
-    title: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct RawReleaseDetail {
     #[serde(default)]
     id: u64,
@@ -1237,8 +1290,6 @@ struct RawReleaseDetail {
     lowest_price: Option<f64>,
     #[serde(default)]
     num_for_sale: Option<u64>,
-    #[serde(default)]
-    videos: Vec<RawVideo>,
 }
 
 impl RawReleaseDetail {
@@ -1296,7 +1347,6 @@ impl RawReleaseDetail {
             num_for_sale: self
                 .num_for_sale
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
-            videos: self.videos.into_iter().map(|v| v.title).collect(),
         })
     }
 }
@@ -1447,6 +1497,35 @@ mod tests {
     }
 
     #[test]
+    fn sale_sellers_arrive_as_a_bare_string_or_a_username_object() {
+        let payload = serde_json::json!({
+            "history": [
+                { "price": 5.0, "currency": "USD", "sold_at": "2023-11-14T22:13:20Z",
+                  "condition": "Very Good Plus (VG+)", "seller": "Shop One" },
+                { "price": 15.0, "currency": "USD", "sold_at": "2023-11-14T22:13:20Z",
+                  "condition": "Excellent Plus (EX+)", "seller": { "username": "Shop Two" } }
+            ]
+        });
+        let sales = sales_from_wire(payload, ReleaseId::new(1).unwrap()).unwrap();
+        assert_eq!(sales.len(), 2);
+        assert_eq!(sales[0].seller.as_deref(), Some("Shop One"));
+        assert_eq!(sales[1].seller.as_deref(), Some("Shop Two"));
+    }
+
+    #[test]
+    fn a_sale_without_a_named_seller_stays_unknown_not_shopless() {
+        let payload = serde_json::json!({
+            "history": [
+                { "price": 5.0, "currency": "USD", "sold_at": "2023-11-14T22:13:20Z" },
+                { "price": 6.0, "currency": "USD", "sold_at": "2023-11-14T22:13:20Z", "seller": "" }
+            ]
+        });
+        let sales = sales_from_wire(payload, ReleaseId::new(1).unwrap()).unwrap();
+        assert_eq!(sales[0].seller, None, "absent on the wire is unknown");
+        assert_eq!(sales[1].seller, None, "an empty username is not a shop");
+    }
+
+    #[test]
     fn wire_sales_convert_price_to_minor_units() {
         let raw = RawSale {
             id: Some(1),
@@ -1455,6 +1534,7 @@ mod tests {
             sold_at: Some("2023-11-14T22:13:20Z".into()),
             condition: Some("Near Mint".into()),
             title: None,
+            seller: None,
         };
         let sale = raw.try_into_sale().unwrap();
         assert_eq!(sale.price.minor_units, 1999);
@@ -1472,6 +1552,7 @@ mod tests {
             sold_at: Some("2023-11-14T22:13:20Z".into()),
             condition: None,
             title: None,
+            seller: None,
         };
         assert_eq!(raw.try_into_sale().unwrap().price.minor_units, 1200);
     }
@@ -1485,6 +1566,7 @@ mod tests {
             sold_at: Some("2023-11-14T22:13:20Z".into()),
             condition: None,
             title: Some("Miles Davis — Signed Copy".into()),
+            seller: None,
         };
         assert!(raw.try_into_sale().unwrap().is_signed);
     }
@@ -1498,6 +1580,7 @@ mod tests {
             sold_at: Some("2023-11-14T22:13:20Z".into()),
             condition: None,
             title: None,
+            seller: None,
         };
         assert_eq!(no_currency.try_into_sale(), Err(WireError::UnknownCurrency));
 
@@ -1508,6 +1591,7 @@ mod tests {
             sold_at: Some("2023-11-14T22:13:20Z".into()),
             condition: None,
             title: None,
+            seller: None,
         };
         assert_eq!(no_price.try_into_sale(), Err(WireError::UnparseablePrice));
     }
@@ -1720,8 +1804,7 @@ mod tests {
                 "rating": { "count": 42, "average": 4.3 }
             },
             "lowest_price": 29.99,
-            "num_for_sale": 7,
-            "videos": [ { "title": "Full album stream", "uri": "" } ]
+            "num_for_sale": 7
         });
         let raw: RawReleaseDetail = serde_json::from_value(payload).unwrap();
         let detail = raw.into_detail().unwrap();

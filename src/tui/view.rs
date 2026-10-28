@@ -23,7 +23,7 @@ use ratatui::{
 
 use crate::domain::browse::{CatalogRow, EntityKind, SearchResult, WantEntry};
 use crate::domain::market::Money;
-use crate::tui::model::{Model, Profile, Screen, Status};
+use crate::tui::model::{Model, Profile, SalesState, Screen, Status};
 
 // Palette — Kanagawa (k/github.com/rebelot/kanagawa). The app paints *no*
 // background of its own: every style only sets a foreground so a
@@ -880,12 +880,45 @@ fn release_body(frame: &mut Frame, area: Rect, model: &Model) {
             ]));
         }
     }
-    if !detail.videos.is_empty() {
-        lines.push(String::new().into());
-        lines.push(Line::from(vec![
-            Span::styled("videos: ", dim()),
-            Span::styled(detail.videos.join(", "), ink()),
-        ]));
+    // Sales: condition, price, shop — one row per sale, replacing the wire's
+    // videos (whose titles were the sheet's only self-promotional content).
+    // Loading is said out loud and failure settles — nothing here spins
+    // forever after a closed job (the rule that ended the eternal loader).
+    lines.push(String::new().into());
+    match &screen.sales {
+        SalesState::Loading => lines.push(Line::from(Span::styled("sales: loading…", dim()))),
+        SalesState::Failed => lines.push(Line::from(Span::styled(
+            "sales: could not fetch (status has the reason)",
+            dim(),
+        ))),
+        SalesState::Rows(rows) if rows.is_empty() => {
+            lines.push(Line::from(Span::styled("sales: none on record", dim())));
+        }
+        SalesState::Rows(rows) => {
+            lines.push(
+                Span::styled(
+                    format!("sales · {}", rows.len()),
+                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+                .into(),
+            );
+            for sale in rows {
+                let condition = crate::domain::valuation::Condition::try_from(sale.condition)
+                    .map_or("unknown".to_string(), |c| c.as_str().to_string());
+                let shop = match &sale.seller {
+                    Some(name) => cut(name, 42),
+                    None => "…".to_string(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{condition:>13}"), dim()),
+                    Span::styled(
+                        format!("  {:>9}", price(Some(&sale.price))),
+                        Style::new().fg(ACCENT),
+                    ),
+                    Span::styled(format!("  {shop}"), ink()),
+                ]));
+            }
+        }
     }
 
     // Scroll the Paragraph (it wraps), then draw. The sheet frame keeps

@@ -147,6 +147,23 @@ impl Default for EntityScreen {
 pub struct ReleaseScreen {
     pub detail: ReleaseDetail,
     pub scroll: usize,
+    /// The release's sale rows, fetched when the sheet opens. `Loading` on
+    /// entry; `Failed` settles it so a network failure cannot leave the
+    /// section spinning forever — the rule the busy-leak fix taught.
+    pub sales: SalesState,
+}
+
+/// What the release sheet knows about its sale rows.
+#[derive(Debug, Default, PartialEq)]
+pub enum SalesState {
+    /// The sheets opens before the sales reply; the view says so.
+    #[default]
+    Loading,
+    /// The rows, as the wire gave them (possibly none — "none on record").
+    Rows(Vec<crate::domain::market::Sale>),
+    /// The fetch failed; shown instead of a fiction, with the status line
+    /// carrying the reason.
+    Failed,
 }
 
 /// The wantlist screen.
@@ -348,6 +365,12 @@ pub enum Msg {
     },
     /// A release detail arrived — either for opening or for enrichment.
     DetailLoaded(OpenRequest, Box<crate::domain::browse::ReleaseDetail>),
+    /// The release sheet's sale rows arrived. Terminal: closes the job the
+    /// open counted.
+    SalesLoaded {
+        release: ReleaseId,
+        sales: Vec<crate::domain::market::Sale>,
+    },
     /// Enrichment could not fetch a detail. Quiet by design: the row stays
     /// unenriched, which is what it was before, and its inflight guard is
     /// cleared so a later tick may retry.
@@ -399,6 +422,9 @@ pub enum Effect {
         release: ReleaseId,
         request: OpenRequest,
     },
+    /// The release sheet's sale rows (condition, price, shop). One request
+    /// per open; the adapter's session cache makes reopens free.
+    LoadSales(ReleaseId),
     /// Enrich one table row in place with the detail's stats.
     Enrich(ReleaseId),
     /// Database search. Requires a token; the adapter refuses otherwise and
@@ -433,6 +459,7 @@ impl Effect {
                 | Self::LoadLabelProfile(_)
                 | Self::LoadRows { .. }
                 | Self::LoadDetail { .. }
+                | Self::LoadSales(_)
                 | Self::Enrich(_)
                 | Self::Search { .. }
         )
@@ -443,8 +470,7 @@ impl Effect {
     /// hit backlog can never strand an artist open behind itself.
     pub fn class(&self) -> EffectClass {
         match self {
-            Self::Enrich(_)
-            | Self::LoadDetail {
+            Self::LoadDetail {
                 request: OpenRequest::Enrich(_) | OpenRequest::EnrichHit(_),
                 ..
             } => EffectClass::Enrichment,

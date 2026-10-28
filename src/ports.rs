@@ -133,6 +133,10 @@ pub trait CatalogSource {
     /// Name search. Requires a token upstream; without one the adapter
     /// returns an error the UI can name.
     fn search(&self, query: &str, kind: Option<EntityKind>, page: u32) -> Result<SearchPage>;
+    /// The release's sale rows — condition, price, seller — flat, as the
+    /// release sheet prints them. Unreadable rows are dropped, not a failure:
+    /// one bad datum must not blank a page of evidence.
+    fn release_sales(&self, id: ReleaseId) -> Result<Vec<Sale>>;
 }
 
 /// The digger's local wantlist: the only truth about what to look for.

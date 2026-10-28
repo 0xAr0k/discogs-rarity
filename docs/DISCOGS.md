@@ -13,6 +13,7 @@ from a 403 page.
 | label profile | `GET /labels/{id}` | optional | `sublabels`, `parentLabel`, `urls` (camelCase on the wire) |
 | artist releases | `GET /artists/{id}/releases?page=&per_page=&sort=year&sort_order=desc` | optional | rows carry `type: release\|master`; `release` rows have `format` (string), `label`, `catno`; `master` rows have only `main_release` + `stats.community.{in_wantlist, in_collection}` — **no format, no label, no catno**, and their `id` is a master id |
 | label releases | `GET /labels/{id}/releases?page=&per_page=` | optional | rows have `format` + `catno`, no `type` (all releases), no stats |
+| release sales | `GET /releases/{id}` | optional | the digger reads the payload's `history` array: `price` (float, minor-unit-converted, USD/EUR/GBP/JPY), `sold_at` (ISO-8601), `condition` (free text, defaults to VG+ when unreadable), `title` (signed/media-only flags are scraped from this), and `seller` — seen as a bare username string **or** an object with `username`; unreadable rows are dropped, not a failure |
 | release detail | `GET /releases/{id}?curr_abbr=USD` | optional | the only endpoint with community stats, prices, tracklist |
 | database search | `GET /database/search?q=&type=&page=&per_page=` | **token required** | 401 anonymously; refused up front with a message that names `DISCOGS_TOKEN` |
 

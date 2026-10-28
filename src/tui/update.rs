@@ -81,10 +81,12 @@ use crate::domain::{
     browse::is_vinyl_format,
     browse::{self, CatalogPage, CatalogRow, EntityKind, ReleaseDetail, SearchResult, WantEntry},
     identity::ReleaseId,
+    market::Sale,
 };
 
 use super::model::{
-    DetailFill, DetailFills, Effect, Model, Msg, OpenRequest, Profile, Screen, SortMode, Status,
+    DetailFill, DetailFills, Effect, Model, Msg, OpenRequest, Profile, SalesState, Screen,
+    SortMode, Status,
 };
 
 /// Advance the model by one message and report work to do, in order.
@@ -143,6 +145,7 @@ fn drive(model: &mut Model, msg: Msg) -> Vec<Effect> {
             added,
         } => want_added(model, kind, id, name, added_at, added),
         Msg::WantRemoved { kind, id, removed } => want_removed(model, kind, id, removed),
+        Msg::SalesLoaded { release, sales } => sales_loaded(model, release, sales),
         Msg::Failed {
             context, message, ..
         } => failed(model, context, message),
@@ -163,6 +166,7 @@ impl Msg {
                 | Msg::LabelLoaded(..)
                 | Msg::RowsLoaded { .. }
                 | Msg::DetailLoaded(..)
+                | Msg::SalesLoaded { .. }
                 | Msg::WantlistLoaded(_)
                 | Msg::EnrichFailed(_)
                 | Msg::Failed { job: true, .. }
@@ -175,6 +179,21 @@ impl Msg {
 // ---------------------------------------------------------------------------
 
 fn failed(model: &mut Model, context: Option<String>, message: String) -> Vec<Effect> {
+    // A failed sale fetch must not leave its section spinning forever: the
+    // failure names its release ("release sales {id}") — settle exactly that
+    // sheet, never a different one opened since. Nothing else keeps a
+    // loading state on this screen.
+    let release = context
+        .as_deref()
+        .and_then(|c| c.strip_prefix("release sales "))
+        .and_then(|id| id.parse::<u64>().ok());
+    if let Some(failed_id) = release
+        && let Some(screen) = model.release.as_mut()
+        && screen.detail.release.id.get() == failed_id
+        && screen.sales == SalesState::Loading
+    {
+        screen.sales = SalesState::Failed;
+    }
     model.status = Some(Status::Error(match context {
         Some(context) => format!("{context}: {message}"),
         None => message,
@@ -327,7 +346,11 @@ fn detail_loaded(model: &mut Model, request: OpenRequest, detail: ReleaseDetail)
         }
         opening if model.pending_open.as_ref() == Some(&opening) => {
             model.pending_open = None;
+            let id = detail.release.id;
             push_release_screen(model, detail);
+            // The sheet is open; its sale rows are next (one request per
+            // open, session-cached in the adapter).
+            return vec![Effect::LoadSales(id)];
         }
         _ => {}
     }
@@ -546,8 +569,25 @@ fn catalog_number(labels: &[crate::domain::release::Label]) -> String {
 }
 
 fn push_release_screen(model: &mut Model, detail: ReleaseDetail) {
-    model.release = Some(super::model::ReleaseScreen { detail, scroll: 0 });
+    model.release = Some(super::model::ReleaseScreen {
+        detail,
+        scroll: 0,
+        sales: SalesState::Loading,
+    });
     model.push(Screen::Release);
+}
+
+/// The release sheet's sale rows arrived. A stale reply — one for a sheet
+/// no longer open or already replaced — finds nothing to fill; that is the
+/// *point* of matching by id.
+fn sales_loaded(model: &mut Model, release: ReleaseId, sales: Vec<Sale>) -> Vec<Effect> {
+    if let Some(screen) = model.release.as_mut()
+        && screen.detail.release.id == release
+    {
+        screen.sales = SalesState::Rows(sales);
+    }
+    // A stale reply finds no sheet of its own; that is the *point*.
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1309,21 @@ mod tests {
         }
     }
 
+    /// One sale row for the sheet tests: sell-out-grade VG+, priced, shop known.
+    fn a_sale() -> crate::domain::market::Sale {
+        crate::domain::market::Sale {
+            price: crate::domain::market::Money {
+                minor_units: 4_599,
+                currency: crate::domain::market::Currency::Usd,
+            },
+            sold_at: 1_700_000_000,
+            condition: 4,
+            is_signed: false,
+            is_media_only: false,
+            seller: Some("shop".into()),
+        }
+    }
+
     fn a_detail(id: ReleaseId) -> ReleaseDetail {
         ReleaseDetail {
             release: crate::domain::release::Release {
@@ -1296,7 +1351,6 @@ mod tests {
                 currency: crate::domain::market::Currency::Usd,
             }),
             num_for_sale: Some(3),
-            videos: vec![],
         }
     }
 
@@ -1587,6 +1641,103 @@ mod tests {
         );
         assert_eq!(model.screen(), Some(&Screen::Release));
         assert!(model.pending_open.is_none(), "the token is spent");
+    }
+
+    #[test]
+    fn the_release_sheet_opens_asking_for_its_sale_rows() {
+        let mut model = entity_with(vec![a_row(1, false, None, "one")]);
+        let one = ReleaseId::new(1).unwrap();
+        model.await_open(OpenRequest::FromEntity(one));
+
+        let effects = update(
+            &mut model,
+            Msg::DetailLoaded(OpenRequest::FromEntity(one), Box::new(a_detail(one))),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::LoadSales(sheet)] if *sheet == one
+        ));
+        assert_eq!(model.release.as_ref().unwrap().sales, SalesState::Loading);
+    }
+
+    #[test]
+    fn sale_rows_land_on_the_open_sheet() {
+        let mut model = entity_with(vec![a_row(1, false, None, "one")]);
+        let one = ReleaseId::new(1).unwrap();
+        model.await_open(OpenRequest::FromEntity(one));
+        update(
+            &mut model,
+            Msg::DetailLoaded(OpenRequest::FromEntity(one), Box::new(a_detail(one))),
+        );
+
+        let rows = vec![a_sale()];
+        let effects = update(
+            &mut model,
+            Msg::SalesLoaded {
+                release: one,
+                sales: rows.clone(),
+            },
+        );
+        assert!(effects.is_empty(), "a fill schedules nothing");
+        assert_eq!(
+            model.release.as_ref().unwrap().sales,
+            SalesState::Rows(rows)
+        );
+    }
+
+    #[test]
+    fn a_failed_sale_fetch_settles_its_section_but_says_why() {
+        let mut model = entity_with(vec![a_row(1, false, None, "one")]);
+        let one = ReleaseId::new(1).unwrap();
+        model.await_open(OpenRequest::FromEntity(one));
+        update(
+            &mut model,
+            Msg::DetailLoaded(OpenRequest::FromEntity(one), Box::new(a_detail(one))),
+        );
+
+        update(
+            &mut model,
+            Msg::Failed {
+                job: true,
+                context: Some(format!("release sales {}", one.get())),
+                message: "rate limited".into(),
+            },
+        );
+        assert_eq!(model.release.as_ref().unwrap().sales, SalesState::Failed);
+        // The reason stays on the status line; the section never spins again.
+        assert_eq!(
+            model.status,
+            Some(Status::Error(format!(
+                "release sales {}: rate limited",
+                one.get()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_sale_failure_for_a_dead_sheet_never_settles_the_live_one() {
+        let mut model = entity_with(vec![a_row(1, false, None, "one")]);
+        let one = ReleaseId::new(1).unwrap();
+        model.await_open(OpenRequest::FromEntity(one));
+        update(
+            &mut model,
+            Msg::DetailLoaded(OpenRequest::FromEntity(one), Box::new(a_detail(one))),
+        );
+
+        // Some other release's sale fetch fails after this sheet opened.
+        update(
+            &mut model,
+            Msg::Failed {
+                job: true,
+                context: Some("release sales 999".into()),
+                message: "gone".into(),
+            },
+        );
+        assert_eq!(
+            model.release.as_ref().unwrap().sales,
+            SalesState::Loading,
+            "only the named fetch settles"
+        );
     }
 
     #[test]
